@@ -1,0 +1,3090 @@
+---
+title: "SLE_LZ-DZ_singlecell"
+author: "Arthur VanValkenburg"
+date: "2022-09-02"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(sva)
+  library(SingleCellExperiment)
+  #library(singleCellTK)
+  library(DESeq2)
+  library(TBSignatureProfiler)
+  library(DT)
+  library(enrichR)
+  library(Rtsne)
+  library(umap)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(tidyverse)
+  library(knitr)
+  library(kableExtra)
+  library(Seurat)
+  library(SeuratObject)
+  library(patchwork)
+  library(cowplot)
+  library(RColorBrewer)
+  library(plotly)
+  library(msigdbr)
+  library(fgsea)
+  library(data.table)
+
+  
+})
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load data
+```{r}
+#umap_proj <- read.csv("cd4_umap_projection.csv")
+path_2m <- file.path("2_month/outs/multi/count/raw_feature_bc_matrix")
+path_4m <- file.path("4_month/outs/multi/count/raw_feature_bc_matrix")
+path_7m <- file.path("7_month/outs/multi/count/raw_feature_bc_matrix")
+
+path_ls <- list(path_2m, path_4m, path_7m)
+
+# Germinal Center labels
+gc_2m <- file.path("2_month/outs/multi/count/Germinal_Center_M2.csv")
+gc_4m <- file.path("4_month/outs/multi/count/Germinal_Center_M4.csv")
+gc_7m <- file.path("7_month/outs/multi/count/Germinal_Center_M7.csv")
+
+gc_ls <- list(gc_2m, gc_4m, gc_7m)
+names(gc_ls) <- c("gc_2m", "gc_4m", "gc_7m")
+gc_labels <- lapply(gc_ls, read_csv)
+# Load the PBMC dataset
+pbmc.data <- lapply(path_ls, Read10X)
+
+
+# Initialize the Seurat object with the raw (non-normalized data).
+pbmc.m2 <- CreateSeuratObject(counts = pbmc.data[[1]]$`Gene Expression`, project = "m2", min.cells = 3, min.features = 200)
+#Add antibody capture data to seurat object (and mouse info)
+pbmc.m2[["ADT"]] <- CreateAssayObject(pbmc.data[[1]][["Antibody Capture"]][, colnames(x = pbmc.m2)])
+
+pbmc.m4 <- CreateSeuratObject(counts = pbmc.data[[2]]$`Gene Expression`, project = "m4", min.cells = 3, min.features = 200)
+#Add antibody capture data to seurat object (and mouse info)
+pbmc.m4[["ADT"]] <- CreateAssayObject(pbmc.data[[2]][["Antibody Capture"]][, colnames(x = pbmc.m4)])
+
+pbmc.m7 <- CreateSeuratObject(counts = pbmc.data[[3]]$`Gene Expression`, project = "m7", min.cells = 3, min.features = 200)
+#Add antibody capture data to seurat object (and mouse info)
+pbmc.m7[["ADT"]] <- CreateAssayObject(pbmc.data[[3]][["Antibody Capture"]][, colnames(x = pbmc.m7)])
+
+# get rid of 2 cells with missing hash
+pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+
+pbmc.m2$mouse_id <- pbmc.m2$nFeature_ADT
+pbmc.m2$mouse_id <- gsub("1", "mouse1", pbmc.m2$mouse_id)
+pbmc.m2$mouse_id <- gsub("2", "mouse3", pbmc.m2$mouse_id)
+
+pbmc.m4$mouse_id <- pbmc.m4$nFeature_ADT
+pbmc.m4$mouse_id <- gsub("1", "mouse1", pbmc.m4$mouse_id)
+pbmc.m4$mouse_id <- gsub("2", "mouse2", pbmc.m4$mouse_id)
+pbmc.m4$mouse_id <- gsub("3", "mouse3", pbmc.m4$mouse_id)
+
+pbmc.m7$mouse_id <- pbmc.m7$nFeature_ADT
+pbmc.m7$mouse_id <- gsub("1", "mouse1", pbmc.m7$mouse_id)
+pbmc.m7$mouse_id <- gsub("2", "mouse2", pbmc.m7$mouse_id)
+pbmc.m7$mouse_id <- gsub("3", "mouse3", pbmc.m7$mouse_id)
+
+
+# Add metadata
+#pbmc.m2 <- AddMetaData(pbmc.m2, gc_labels$gc_2m , col.name = "GC_id")
+#pbmc.m2$gc_id <- cbind.na("id"=rownames(pbmc.m2@meta.data), gc_labels$gc_2m)
+df <- pbmc.m2@meta.data
+df$Barcode <- rownames(df)
+df <- merge(df, gc_labels$gc_2m)
+df <- column_to_rownames(df, var="Barcode")
+pbmc.m2@meta.data <- df
+
+
+df <- pbmc.m4@meta.data
+df$Barcode <- rownames(df)
+df <- merge(df, gc_labels$gc_4m)
+df <- column_to_rownames(df, var="Barcode")
+pbmc.m4@meta.data <- df
+
+
+df <- pbmc.m7@meta.data
+df$Barcode <- rownames(df)
+df <- merge(df, gc_labels$gc_7m)
+df <- column_to_rownames(df, var="Barcode")
+pbmc.m7@meta.data <- df
+
+# remove objects to save memory
+rm(pbmc.data)
+```
+# M2
+## QC 
+```{r}
+pbmc <- pbmc.m2
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+
+
+#
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# save figures
+path <- file.path("outs/QC_plots")
+
+ggsave(file.path(path, "prefilter_violin_feature_count_percent-mt_m2.svg"), width=7, height=7)
+```
+
+### Plot
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+ggsave(file.path(path, "prefilter_scatter_feature_count_percent-mt_m2.svg"), width=14, height=7)
+```
+### Filtering
+```{r}
+
+#pbmc.1 <- subset(pbmc, subset=nCount_RNA >200 & nCount_RNA < 4500 & percent.mt < 8 )
+# Filter from Loupe object; removes NAs
+pbmc <- subset(pbmc, subset=nCount_RNA>200  & nFeature_RNA < 6500 & nCount_RNA < 45000 & percent.mt < 30 )
+# 
+table(pbmc$mouse_id)
+```
+
+#### Filtering graphs
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+ggsave(file.path(path, "postfilter_scatter_feature_count_percent-mt_m2.svg"), width=14, height=7)
+
+```
+
+
+
+## Normalize data
+VST function calculates a variance stabilizing transformation (VST) from the fitted dispersion-mean relation(s) and then transforms the count data (normalized by division by the size factors or normalization factors), yielding a matrix of values which are now approximately homoskedastic (having constant variance along the range of mean values). The transformation also normalizes with respect to library size. The rlog is less sensitive to size factors, which can be an issue when size factors vary widely. These transformations are useful when checking for outliers or as input for machine learning techniques such as clustering or linear discriminant analysis.
+## Normalize and Find Top Variable genes
+```{r}
+#https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize") %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) 
+
+pbmc <- NormalizeData(pbmc, assay = "ADT", normalization.method = "CLR")
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+## Ridgeplot of mouse ID's
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+RidgePlot(pbmc, assay = "ADT", features = rownames(pbmc[["ADT"]]), ncol = 2)
+
+```
+## Scale Data and run clustering
+```{r}
+
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes) %>% 
+  RunPCA(features = VariableFeatures(object = pbmc), verbose = FALSE) %>% 
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, verbose = FALSE) %>%
+  RunTSNE() %>%
+  RunUMAP(dims = 1:30) 
+  
+
+```
+
+## PCA
+### Top genes in principle components
+```{r}
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+### Genes in first 2 dimensions
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+```
+
+### PCA Plot
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+DimPlot(pbmc, reduction = "pca")
+```
+
+## Dimension heatmap
+From the tutorial: In particular DimHeatmap() allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting cells to a number plots the ‘extreme’ cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.
+```{r}
+DimHeatmap(pbmc, dims = 1:3, cells = 500, balanced = TRUE) # demonstrate the cells with the most heterogeneity
+```
+
+
+## Determine the ‘dimensionality’ of the dataset
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a ‘null distribution’ of feature scores, and repeat this procedure. We identify ‘significant’ PCs as those who have a strong enrichment of low p-value features.
+
+The JackStrawPlot() function provides a visualization tool for comparing the distribution of p-values for each PC with a uniform distribution (dashed line). ‘Significant’ PCs will show a strong enrichment of features with low p-values (solid curve above the dashed line). In this case it appears that there is a sharp drop-off in significance after the first 10-12 PCs.
+### JackStraw Plot
+```{r}
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+
+
+### Elbow Plot 
+```{r}
+ElbowPlot(pbmc)
+```
+
+
+
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+
+
+## Clustering
+
+Seurat v3 applies a graph-based clustering approach, building upon initial strategies in (Macosko et al). Importantly, the distance metric which drives the clustering analysis (based on previously identified PCs) remains the same. However, our approach to partitioning the cellular distance matrix into clusters has dramatically improved. Our approach was heavily inspired by recent manuscripts which applied graph-based clustering approaches to scRNA-seq data [SNN-Cliq, Xu and Su, Bioinformatics, 2015] and CyTOF data [PhenoGraph, Levine et al., Cell, 2015]. Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected ‘quasi-cliques’ or ‘communities’.
+
+As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs).
+
+To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [SLM, Blondel et al., Journal of Statistical Mechanics], to iteratively group cells together, with the goal of optimizing the standard modularity function. The FindClusters() function implements this procedure, and contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the Idents() function.
+### Clusters
+
+```{r}
+pbmc <- FindNeighbors(pbmc, dims=1:20)
+```
+```{r}
+
+pbmc <- FindClusters(pbmc, resolution=c(0.1, 0.3, 0.5, 0.7, 1))
+
+```
+
+## Plot clusters {.tabset}
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.1", label=T)
+```
+
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.3", label=T)
+```
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.5", label=T)
+```
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.7", label=T)
+```
+### Resolution 1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.1", label=T)
+```
+
+## Zone Genelists
+```{r}
+gene_dz <- c(	"Arhgap45",
+              "Arhgef1",
+              "Cd79b",
+              "Sipa1",
+              "Arhgap4",
+              "Helz2",
+              "Pax5",
+              "Itpr3",
+              "Pik3cd",
+              "H2-Ob",
+              "Safb2",
+              "Siglecg",
+              "Neil1",
+              "Syk",	
+              "Coro1a",
+              "Prrc2a",
+              "Slc1a5",
+              "Syvn1")
+
+# gene_gz <- c( #"Rn45s",
+#             	"Mki67",
+#             	"Lars2",
+#             	"Ncapd2",
+#             	"Top2a",
+#             	"Incenp",
+#             	"Tuba1c",
+#             	"Cdca5",
+#             	"Ccnb1",
+#             	"Cdk1",
+#             	"Birc5",
+#             	"Bub3")
+# 	
+
+gene_lz <- c("Myc",
+          	"Mycbp2",
+          	"H2-Eb1",
+          	"Rps3",
+          	"Eef1a1",
+          	"Ptpn6",
+          	"Myh9",
+          	"Swap70",
+          	"Pfn1",
+          	"Atp5b",
+          	#"NCI",
+          	"Cd74",
+          	"Actb",
+          	"Cd22",
+          	"Hsp90ab1",
+          	"Eef2",
+          	#"Rrpl4",
+          	"Eef1a1",
+          	"Rack1")
+	
+
+all(gene_dz %in% rownames(pbmc))
+all(gene_lz %in% rownames(pbmc))
+#all(gene_gz %in% rownames(pbmc))
+
+z <- rownames(pbmc)
+#z[which(gene_dz %in% z)]
+
+missing_dz <- gene_dz[!(gene_dz %in% z)]
+missing_dz
+z[grep("ARHGAP45", ignore.case = T, z)]
+#"Arhgap45"
+z[grep("CD79b", ignore.case = T, z)]
+#"Cd79b"
+missing_lz <- gene_lz[!(gene_lz %in% z)] #Gnb2l1="Rack1"; 
+missing_lz #"Gnb2l1":"Rack1"; "NCI":unkonwn;    "CD74":Cd74;   "Rrpl4";unknown
+z[grep("Rrpl4", ignore.case = T, z)]
+
+
+# missing_gz <- gene_gz[!(gene_gz %in% z)]
+# missing_gz #"Rn45s"
+# z[grep("Rn45s", ignore.case = T, z)]
+
+```
+## Identify genes in clusters
+## Dark zone first 6 genes
+```{r}
+FeaturePlot(pbmc, features = gene_dz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_dz[10:18], min.cutoff = "q9")
+```
+
+
+## Light zone
+```{r}
+FeaturePlot(pbmc, features = gene_lz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_lz[10:17], min.cutoff = "q9")
+```
+
+
+## Grey zone
+```{r}
+#FeaturePlot(pbmc, features = gene_gz[1:11], min.cutoff = "q9")
+```
+## Dotplot of genes per cluster {.tabset}
+### Dark Zone
+```{r}
+Idents(pbmc) <- pbmc$RNA_snn_res.0.3
+markers.to.plot <- unique(gene_dz)
+DotPlot(pbmc, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+
+```
+### Light Zone
+```{r}
+markers.to.plot <- unique(gene_lz)
+DotPlot(pbmc, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+
+```
+
+### Grey Zone
+```{r}
+# markers.to.plot <- unique(gene_gz)
+# DotPlot(pbmc, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+
+```
+Clusters 7, 12, and 13 seem to be grey zone B cells, with 7 and 12 extremely close in the UMAP
+
+## Violin Plots
+## Dark Zone
+```{r}
+plots <- VlnPlot(pbmc, features = gene_dz,  
+    pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 1)
+```
+## Light Zone
+```{r}
+plots <- VlnPlot(pbmc, features = gene_lz,  
+    pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 1)
+```
+
+## Grey Zone
+```{r}
+# plots <- VlnPlot(pbmc, features = gene_gz,  
+#     pt.size = 0, combine = FALSE)
+# wrap_plots(plots = plots, ncol = 1)
+```
+
+## Differential Expression
+```{r}
+# list options for groups to perform differential expression on
+levels(pbmc)
+#Idents(pbmc) <- pbmc$mouse_id
+```
+
+
+
+
+
+o	TotalSeq C0304 anti-mouse hashtag 4 (mouse 1 of each group)
+	The barcode flanking sequences are CGGAGATGTGTATAAGAGACAGNNNNNNNNNN (PCR handle), and NNNNNNNNNCCCATATAAGA*A*A (capture sequence)
+	Cat: 155867
+o	TotalSeq C0307 anti-mouse hashtag 7 (mouse 2 of each group)
+	The barcode flanking sequences are CGGAGATGTGTATAAGAGACAGNNNNNNNNNN (PCR handle), and NNNNNNNNNCCCATATAAGA*A*A (capture sequence)
+	Cat: 155873
+o	TotalSeq C0309 anti-mouse hashtag 9 (mouse 3 of each group)
+	The barcode flanking sequences are CGGAGATGTGTATAAGAGACAGNNNNNNNNNN (PCR handle), and NNNNNNNNNCCCATATAAGA*A*A (capture sequence)
+
+```{r}
+# individual mouse barcodes
+# path <- file.path("2_month/outs/")
+# path_h5 <- file.path("2_month/outs/multi/count/")
+# mat <- readSingleCellMatrix(file.path(path, "matrix.mtx.gz"))
+# 
+# barcodes <- read_tsv(file.path(path,'barcodes.tsv.gz'), col_names =FALSE)
+# features <- read_tsv(file.path(path,'features.tsv.gz'), col_names = FALSE)
+
+# M1 <- "AAAGCATTCTTCACG"
+# M2 <- "GAGTCTGCCAGTATC"
+# M3 <- "TGCCTATGAAACAAG"
+
+pbmc.m2 <- pbmc
+
+```
+
+
+# M4
+## QC
+```{r}
+pbmc <- pbmc.m4
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+
+
+#
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+ggsave(file.path(path, "prefilter_violin_feature_count_percent-mt_m4.svg"), width=7, height=7)
+
+```
+### Plots
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+ggsave(file.path(path, "prefilter_scatter_feature_count_percent-mt_m4.svg"), width=7, height=7)
+
+```
+### Filtering
+```{r}
+#pbmc.1 <- subset(pbmc, subset=nCount_RNA >200 & nCount_RNA < 4500 & percent.mt < 8 )
+# Filter from Loupe object; removes NAs
+pbmc <- subset(pbmc, subset=nCount_RNA>200  & nFeature_RNA < 6500 & nCount_RNA < 45000 & percent.mt < 20 )
+# 
+table(pbmc$mouse_id)
+```
+
+### Filtering graphs
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+ggsave(file.path(path, "postfilter_violin_feature_count_percent-mt_m4.svg"), width=7, height=7)
+
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+ggsave(file.path(path, "postfilter_scatter_feature_count_percent-mt_m4.svg"), width=7, height=7)
+
+```
+
+
+
+## Normalize data
+VST function calculates a variance stabilizing transformation (VST) from the fitted dispersion-mean relation(s) and then transforms the count data (normalized by division by the size factors or normalization factors), yielding a matrix of values which are now approximately homoskedastic (having constant variance along the range of mean values). The transformation also normalizes with respect to library size. The rlog is less sensitive to size factors, which can be an issue when size factors vary widely. These transformations are useful when checking for outliers or as input for machine learning techniques such as clustering or linear discriminant analysis.
+### Normalize and Find Top Variable genes
+```{r}
+#https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize") %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) 
+
+pbmc <- NormalizeData(pbmc, assay = "ADT", normalization.method = "CLR")
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+## Ridgeplot of mouse ID's
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+RidgePlot(pbmc, assay = "ADT", features = rownames(pbmc[["ADT"]]), ncol = 2)
+
+```
+## Scale Data and run clustering
+```{r}
+
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes) %>% 
+  RunPCA(features = VariableFeatures(object = pbmc), verbose = FALSE) %>% 
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, verbose = FALSE) %>%
+  RunTSNE() %>%
+  RunUMAP(dims = 1:30) 
+  
+
+```
+
+## PCA
+### Top genes in principle components
+```{r}
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+### Genes in first 2 dimensions
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+```
+
+### PCA Plot
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+DimPlot(pbmc, reduction = "pca")
+```
+
+### Dimension heatmap
+From the tutorial: In particular DimHeatmap() allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting cells to a number plots the ‘extreme’ cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.
+```{r}
+DimHeatmap(pbmc, dims = 1:3, cells = 500, balanced = TRUE) # demonstrate the cells with the most heterogeneity
+```
+
+
+## Determine the ‘dimensionality’ of the dataset
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a ‘null distribution’ of feature scores, and repeat this procedure. We identify ‘significant’ PCs as those who have a strong enrichment of low p-value features.
+
+The JackStrawPlot() function provides a visualization tool for comparing the distribution of p-values for each PC with a uniform distribution (dashed line). ‘Significant’ PCs will show a strong enrichment of features with low p-values (solid curve above the dashed line). In this case it appears that there is a sharp drop-off in significance after the first 10-12 PCs.
+### JackStraw Plot
+```{r}
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+
+
+### Elbow Plot 
+```{r}
+ElbowPlot(pbmc)
+```
+
+
+### top 10 genes
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+### Variable features plot
+```{r}
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+```
+
+
+## Clustering
+
+Seurat v3 applies a graph-based clustering approach, building upon initial strategies in (Macosko et al). Importantly, the distance metric which drives the clustering analysis (based on previously identified PCs) remains the same. However, our approach to partitioning the cellular distance matrix into clusters has dramatically improved. Our approach was heavily inspired by recent manuscripts which applied graph-based clustering approaches to scRNA-seq data [SNN-Cliq, Xu and Su, Bioinformatics, 2015] and CyTOF data [PhenoGraph, Levine et al., Cell, 2015]. Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected ‘quasi-cliques’ or ‘communities’.
+
+As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs).
+
+To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [SLM, Blondel et al., Journal of Statistical Mechanics], to iteratively group cells together, with the goal of optimizing the standard modularity function. The FindClusters() function implements this procedure, and contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the Idents() function.
+### Clusters
+
+```{r}
+pbmc <- FindNeighbors(pbmc, dims=1:20)
+```
+```{r}
+pbmc <- FindClusters(pbmc, resolution=c(0.1, 0.3, 0.5, 0.7, 1))
+```
+
+## Plot clusters {.tabset}
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.1", label=T)
+```
+
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.3", label=T)
+```
+### Resolution 0.5
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.5", label=T)
+```
+### Resolution 0.7
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.7", label=T)
+```
+### Resolution 1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.1", label=T)
+```
+
+## Zone Genelists
+```{r}
+gene_dz <- c(	"Arhgap45",
+              "Arhgef1",
+              "Cd79b",
+              "Sipa1",
+              "Arhgap4",
+              "Helz2",
+              "Pax5",
+              "Itpr3",
+              "Pik3cd",
+              "H2-Ob",
+              "Safb2",
+              "Siglecg",
+              "Neil1",
+              "Syk",	
+              "Coro1a",
+              "Prrc2a",
+              "Slc1a5",
+              "Syvn1")
+
+gene_gz <- c( #"Rn45s",
+            	"Mki67",
+            	"Lars2",
+            	"Ncapd2",
+            	"Top2a",
+            	"Incenp",
+            	"Tuba1c",
+            	"Cdca5",
+            	"Ccnb1",
+            	"Cdk1",
+            	"Birc5",
+            	"Bub3")
+	
+
+gene_lz <- c("Myc",
+          	"Mycbp2",
+          	"H2-Eb1",
+          	"Rps3",
+          	"Eef1a1",
+          	"Ptpn6",
+          	"Myh9",
+          	"Swap70",
+          	"Pfn1",
+          	"Atp5b",
+          	#"NCI",
+          	"Cd74",
+          	"Actb",
+          	"Cd22",
+          	"Hsp90ab1",
+          	"Eef2",
+          	#"Rrpl4",
+          	"Eef1a1",
+          	"Rack1")
+	
+
+all(gene_dz %in% rownames(pbmc))
+all(gene_lz %in% rownames(pbmc))
+all(gene_gz %in% rownames(pbmc))
+
+z <- rownames(pbmc)
+#z[which(gene_dz %in% z)]
+
+missing_dz <- gene_dz[!(gene_dz %in% z)]
+missing_dz
+z[grep("ARHGAP45", ignore.case = T, z)]
+#"Arhgap45"
+z[grep("CD79b", ignore.case = T, z)]
+#"Cd79b"
+missing_lz <- gene_lz[!(gene_lz %in% z)] #Gnb2l1="Rack1"; 
+missing_lz #"Gnb2l1":"Rack1"; "NCI":unkonwn;    "CD74":Cd74;   "Rrpl4";unknown
+z[grep("Rrpl4", ignore.case = T, z)]
+
+
+missing_gz <- gene_gz[!(gene_gz %in% z)]
+missing_gz #"Rn45s"
+z[grep("Rn45s", ignore.case = T, z)]
+
+```
+## Identify genes in clusters
+## Dark zone first 6 genes
+```{r}
+FeaturePlot(pbmc, features = gene_dz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_dz[10:18], min.cutoff = "q9")
+```
+
+
+## Light zone
+```{r}
+FeaturePlot(pbmc, features = gene_lz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_lz[10:17], min.cutoff = "q9")
+```
+
+## store m4 data
+```{r}
+pbmc.m4 <- pbmc
+```
+
+
+
+# QC
+```{r}
+pbmc <- pbmc.m7
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+
+
+#
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+ggsave(file.path(path, "prefilter_violin_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+```
+## plots
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+ggsave(file.path(path, "prefilter_scatter_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+```
+## Filtering
+```{r}
+#pbmc.1 <- subset(pbmc, subset=nCount_RNA >200 & nCount_RNA < 4500 & percent.mt < 8 )
+# Filter from Loupe object; removes NAs
+pbmc <- subset(pbmc, subset=nCount_RNA>200  & nFeature_RNA < 6500 & nCount_RNA < 45000 & percent.mt < 30 )
+# 
+table(pbmc$mouse_id)
+```
+
+### Filtering graphs
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+ggsave(file.path(path, "postfilter_violin_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+ggsave(file.path(path, "postfilter_scatter_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+```
+
+
+
+# Normalize data
+VST function calculates a variance stabilizing transformation (VST) from the fitted dispersion-mean relation(s) and then transforms the count data (normalized by division by the size factors or normalization factors), yielding a matrix of values which are now approximately homoskedastic (having constant variance along the range of mean values). The transformation also normalizes with respect to library size. The rlog is less sensitive to size factors, which can be an issue when size factors vary widely. These transformations are useful when checking for outliers or as input for machine learning techniques such as clustering or linear discriminant analysis.
+## Normalize and Find Top Variable genes
+```{r}
+#https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize") %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) 
+
+pbmc <- NormalizeData(pbmc, assay = "ADT", normalization.method = "CLR")
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+## Ridgeplot of mouse ID's
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+RidgePlot(pbmc, assay = "ADT", features = rownames(pbmc[["ADT"]]), ncol = 2)
+
+```
+## Scale Data and run clustering
+```{r}
+
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes) %>% 
+  RunPCA(features = VariableFeatures(object = pbmc), verbose = FALSE) %>% 
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, verbose = FALSE) %>%
+  RunTSNE() %>%
+  RunUMAP(dims = 1:30) 
+  
+
+```
+
+## PCA
+### Top genes in principle components
+```{r}
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+### Genes in first 2 dimensions
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+```
+
+### PCA Plot
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+DimPlot(pbmc, reduction = "pca")
+```
+
+### Dimension heatmap
+From the tutorial: In particular DimHeatmap() allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting cells to a number plots the ‘extreme’ cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.
+```{r}
+DimHeatmap(pbmc, dims = 1:3, cells = 500, balanced = TRUE) # demonstrate the cells with the most heterogeneity
+```
+
+
+## Determine the ‘dimensionality’ of the dataset
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a ‘null distribution’ of feature scores, and repeat this procedure. We identify ‘significant’ PCs as those who have a strong enrichment of low p-value features.
+
+The JackStrawPlot() function provides a visualization tool for comparing the distribution of p-values for each PC with a uniform distribution (dashed line). ‘Significant’ PCs will show a strong enrichment of features with low p-values (solid curve above the dashed line). In this case it appears that there is a sharp drop-off in significance after the first 10-12 PCs.
+### JackStraw Plot
+```{r}
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+
+
+### Elbow Plot 
+```{r}
+ElbowPlot(pbmc)
+```
+
+
+
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+
+```{r}
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+```
+
+
+## Clustering
+
+Seurat v3 applies a graph-based clustering approach, building upon initial strategies in (Macosko et al). Importantly, the distance metric which drives the clustering analysis (based on previously identified PCs) remains the same. However, our approach to partitioning the cellular distance matrix into clusters has dramatically improved. Our approach was heavily inspired by recent manuscripts which applied graph-based clustering approaches to scRNA-seq data [SNN-Cliq, Xu and Su, Bioinformatics, 2015] and CyTOF data [PhenoGraph, Levine et al., Cell, 2015]. Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected ‘quasi-cliques’ or ‘communities’.
+
+As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs).
+
+To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [SLM, Blondel et al., Journal of Statistical Mechanics], to iteratively group cells together, with the goal of optimizing the standard modularity function. The FindClusters() function implements this procedure, and contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the Idents() function.
+### Clusters
+
+```{r}
+pbmc <- FindNeighbors(pbmc, dims=1:20)
+```
+```{r}
+pbmc <- FindClusters(pbmc, resolution=c(0.1, 0.3, 0.5, 0.7, 1))
+```
+
+### Plot clusters {.tabset}
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.1", label=T)
+```
+
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.3", label=T)
+```
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.5", label=T)
+```
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.7", label=T)
+```
+### Resolution 1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.1", label=T)
+```
+
+## Zone Genelists
+```{r}
+gene_dz <- c(	"Arhgap45",
+              "Arhgef1",
+              "Cd79b",
+              "Sipa1",
+              "Arhgap4",
+              "Helz2",
+              "Pax5",
+              "Itpr3",
+              "Pik3cd",
+              "H2-Ob",
+              "Safb2",
+              "Siglecg",
+              "Neil1",
+              "Syk",	
+              "Coro1a",
+              "Prrc2a",
+              "Slc1a5",
+              "Syvn1")
+
+# gene_gz <- c( #"Rn45s",
+#             	"Mki67",
+#             	"Lars2",
+#             	"Ncapd2",
+#             	"Top2a",
+#             	"Incenp",
+#             	"Tuba1c",
+#             	"Cdca5",
+#             	"Ccnb1",
+#             	"Cdk1",
+#             	"Birc5",
+#             	"Bub3")
+	
+
+gene_lz <- c("Myc",
+          	"Mycbp2",
+          	"H2-Eb1",
+          	"Rps3",
+          	"Eef1a1",
+          	"Ptpn6",
+          	"Myh9",
+          	"Swap70",
+          	"Pfn1",
+          	"Atp5b",
+          	#"NCI",
+          	"Cd74",
+          	"Actb",
+          	"Cd22",
+          	"Hsp90ab1",
+          	"Eef2",
+          	#"Rrpl4",
+          	"Eef1a1",
+          	"Rack1")
+	
+
+all(gene_dz %in% rownames(pbmc))
+all(gene_lz %in% rownames(pbmc))
+#all(gene_gz %in% rownames(pbmc))
+
+z <- rownames(pbmc)
+#z[which(gene_dz %in% z)]
+
+missing_dz <- gene_dz[!(gene_dz %in% z)]
+missing_dz
+z[grep("ARHGAP45", ignore.case = T, z)]
+#"Arhgap45"
+z[grep("CD79b", ignore.case = T, z)]
+#"Cd79b"
+missing_lz <- gene_lz[!(gene_lz %in% z)] #Gnb2l1="Rack1"; 
+missing_lz #"Gnb2l1":"Rack1"; "NCI":unkonwn;    "CD74":Cd74;   "Rrpl4";unknown
+z[grep("Rrpl4", ignore.case = T, z)]
+
+
+# missing_gz <- gene_gz[!(gene_gz %in% z)]
+# missing_gz #"Rn45s"
+# z[grep("Rn45s", ignore.case = T, z)]
+
+```
+## Identify genes in clusters
+### Dark zone first 6 genes
+```{r}
+FeaturePlot(pbmc, features = gene_dz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_dz[10:18], min.cutoff = "q9")
+```
+
+
+### Light zone
+```{r}
+FeaturePlot(pbmc, features = gene_lz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_lz[10:17], min.cutoff = "q9")
+```
+
+## store M7 data
+```{r}
+pbmc.m7 <- pbmc
+```
+```{r}
+saveRDS(pbmc.m2, "pbmc_m2.RDS")
+saveRDS(pbmc.m4, "pbmc_m4.RDS")
+saveRDS(pbmc.m7, "pbmc_m7.RDS")
+
+```
+
+
+# Combine Timepoints
+## Combining Seurat objects
+```{r}
+# integrate 3 experiments
+ls <- list(pbmc.m2, pbmc.m4, pbmc.m7)
+
+immune.anchors <- FindIntegrationAnchors(object.list = ls,  reduction="rpca")
+
+pbmc.int <- IntegrateData(anchorset = immune.anchors)
+
+# make sure mouse_id includes timepoints
+
+
+# cleans
+rm(immune.anchors, ls, pbmc.m2, pbmc.m4, pbmc.m7, pbmc)
+```
+
+## Compare clusters by time
+```{r}
+DefaultAssay(pbmc.int) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+pbmc.int <- ScaleData(pbmc.int, verbose = FALSE)
+pbmc.int <- RunPCA(pbmc.int, npcs = 30, verbose = FALSE)
+# UMAP and Clustering
+pbmc.int <- RunUMAP(pbmc.int, reduction = "pca", dims = 1:20)
+pbmc.int <- FindNeighbors(pbmc.int, reduction = "pca", dims = 1:20)
+pbmc.int <- FindClusters(pbmc.int, resolution = 0.5)
+```
+
+### plots
+```{r}
+# Visualization
+p1 <- DimPlot(pbmc.int, reduction = "umap", group.by = "orig.ident")
+p2 <- DimPlot(pbmc.int, reduction = "umap", label = TRUE)
+
+png("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_integrated.png")
+p2
+dev.off()
+p2
+ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_integrated.svg", plot=p2)
+p2
+
+plot_grid(p1, p2)
+
+```
+
+```{r}
+g <- DimPlot(pbmc.int, reduction = "umap", split.by = "orig.ident", label=T)
+g
+ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_by_time_integrated.png")
+ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_by_time_integrated.svg", device = "svg", width = 120, height = 60, units = "mm")
+g
+
+m2 <- DimPlot(pbmc.int, reduction = "umap",  cells=pbmc.int@meta.data$orig.ident=="m2" ,label=T)
+ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_m2.svg", plot=m2, device="svg")
+m4 <- DimPlot(pbmc.int, reduction = "umap",  cells=pbmc.int@meta.data$orig.ident=="m4" ,label=T)
+ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_m4.svg", plot=m4, device="svg")
+m7 <- DimPlot(pbmc.int, reduction = "umap",  cells=pbmc.int@meta.data$orig.ident=="m7" ,label=T)
+ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_m7.svg", plot=m7, device="svg")
+
+m2 + m4 + m7
+```
+```{r}
+p2 
+```
+
+### Dotplot of percentage cells within each cluster by time
+```{r}
+
+path <- file.path("outs/figure_plots/cell_population_by_cluster")
+dir.create(path)
+# DotPlot only does genes
+md <- pbmc.int@meta.data %>% as.data.table
+# the resulting md object has one "row" per cell
+
+## count the number of cells per unique combinations of "Sample" and "seurat_clusters"
+x <- md[, .N, by = c("orig.ident", "seurat_clusters")]%>% dcast(., orig.ident ~ seurat_clusters, value.var = "N")
+
+x <- column_to_rownames(x, var="orig.ident")
+y <- x/rowSums(x)
+write.csv(y, file.path(path, "cell_percentage_by_cluster.csv"))
+write.csv(x, file.path(path, "cell_number_by_cluster.csv"))
+y <- rownames_to_column(y, var="time")
+
+
+z <- melt(y)
+colnames(z) <- c("time", "cluster", "percentage")
+
+ggplot(z, aes(x=cluster, y=time, size=percentage))+geom_point()
+ggsave(file.path(path, "cell_percentage_dotplot.svg"),width=7, height=7, device="svg")
+ggsave(file.path(path, "cell_percentage_dotplot.png"),width=7, height=7, device="png")
+
+
+
+
+```
+```{r}
+p <- ggplot(data=z, aes(x=cluster, y=percentage, fill=time)) +
+geom_bar(stat="identity", color="black", position=position_dodge())+
+  theme_minimal()
+
+# Use brewer color palettes
+p + scale_fill_brewer(palette="Blues")
+ggsave(file.path(path, "cell_percentage_barplot.svg"),width=7, height=7, device="svg")
+ggsave(file.path(path, "cell_percentage_barplot.png"),width=7, height=7, device="png")
+
+```
+
+
+### Find markers associated with each cluster
+```{r}
+cluster_markers <- FindAllMarkers(pbmc.int, test.use = "MAST")
+write.csv(cluster_markers, "outs/cluster_markers_integrated_all.csv")
+```
+
+### IL21r Myc and Cd40 UMAP
+```{r}
+
+DefaultAssay(pbmc.int) <- "RNA"
+genes <- c("Il21r", "Myc", "Cd40")
+g <- FeaturePlot(pbmc.int, features = genes, min.cutoff = "q9", split.by = "orig.ident", pt.size=0.1)
+g
+ggsave("outs/figure_plots/Gene_expression_UMAP/Il21r_Myc_Cd40_by_time_integrated.png")
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/Il21r_Myc_Cd40_by_time_integrated.svg")
+g
+
+```
+### ROCK2
+```{r}
+
+DefaultAssay(pbmc.int) <- "RNA"
+#genes <- c("Rock2")
+g <- FeaturePlot(pbmc.int, features = "Rock2", min.cutoff = "q9", split.by = "orig.ident", pt.size=0.1, label=T,cols = c("lightgrey", "#ff0000"))
+g
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_by_time_integrated.png", width=21, height=7)
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_by_time_integrated.svg", width=21, height=7)
+
+g
+
+```
+### Rock2 m2
+```{r}
+g <- FeaturePlot((pbmc.m2), features = "Rock2", min.cutoff = "q9", split.by = "orig.ident", pt.size=0.1, label=T,cols = c("lightgrey", "#ff0000"))
+g
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_m2.png", width=7, height=7)
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_m2.svg", width=7, height=7)
+
+## m4
+g <- FeaturePlot((pbmc.m4), features = "Rock2", min.cutoff = "q9", split.by = "orig.ident", pt.size=0.1, label=T,cols = c("lightgrey", "#ff0000"))
+g
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_m4.png", width=7, height=7)
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_m4.svg", width=7, height=7)
+
+
+## m7
+g <- FeaturePlot((pbmc.m7), features = "Rock2", min.cutoff = "q9", split.by = "orig.ident", pt.size=0.1, label=T,cols = c("lightgrey", "#ff0000"))
+g
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_m7.png", width=7, height=7)
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/Rock2_m7.svg", width=7, height=7)
+
+
+```
+### Rock2 Dotplot
+```{r}
+p1 <- DotPlot(subset(pbmc.int,orig.ident=="m2"), features = rev("Rock2"), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+p2 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev("Rock2"), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+p3 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev("Rock2"), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+p1 + p2 + p3
+
+ggsave("outs/figure_plots/myc_rock2_enrichment/rock2_dotplot_each_timepoint.svg", width=21, height=7)
+```
+
+### Rock2 genes Dotplot
+```{r}
+markers.to.plot <- c("Sqle",
+                    "Hmgcs1",
+                    "Hmgcr",
+                    "Idi1",
+                    "Lss")
+p1 <- DotPlot(subset(pbmc.int,orig.ident=="m2"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+p2 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+p3 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+p1 + p2 + p3
+
+ggsave("outs/figure_plots/myc_rock2_enrichment/cholesterol_genes_dotplot_each_timepoint.svg", width=21, height=7)
+```
+
+### Luo genes UMAP
+```{r}
+genes <- c("Bcl6", "Myc", "Ccnd2", "Ccr6", "Hhex", "Prdm1", "Xbp1", "Irf4", "Sdc1","Ighv1-9")
+
+
+## bad for color blindness
+g <- FeaturePlot(pbmc.int, features = genes, min.cutoff = "q9", cols = c("lightgrey", "#ff0000", "#00ff00"))
+g
+
+#png("outs/figure_plots/Gene_expression_UMAP/bad_for_color_blind.png")
+ggsave("outs/figure_plots/Gene_expression_UMAP/bad_for_color_blind.png", width = 12, height = 7)
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/bad_for_color_blind.svg", device="svg",width = 12, height = 7)
+
+g <- FeaturePlot(pbmc.int, features = genes, min.cutoff = "q9", cols = c("lightgrey", "#ff0000"))
+g
+ggsave("outs/figure_plots/Gene_expression_UMAP/integrated_feature_expression.png", width = 12, height = 7)
+
+ggsave("outs/figure_plots/Gene_expression_UMAP/integrated_feature_expression.svg", device="svg",width = 12, height = 7)
+
+```
+
+## Plot genes from May 2 list
+```{r}
+#Foxo1, Pi3k, and Nfkb , "Nfkb1", "Nfkb2", "Foxo1"), "Nfkb1", "Foxo1"
+DefaultAssay(pbmc.int) <- "RNA"
+
+
+markers.to.plot  <- c("Il21r", "Myc", "Cd40", "Pik3ca", "Nfkb1", "Nfkb2", "Foxo1")
+ #pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+p1 <- DotPlot(subset(pbmc.int,orig.ident=="m2"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p1
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_m2.svg", width=7, height = 7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_m2.png", width=7, height = 7)
+
+p1
+
+p2 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_m4.svg", width=7, height = 7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_m4.png", width=7, height = 7)
+p2
+
+
+p3<- DotPlot(subset(pbmc.int,orig.ident=="m7"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p3
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_m7.svg", width=7, height = 7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_m7.png", width=7, height = 7)
+
+p3
+
+
+p1+p2+p3
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_all_timepoints.png", width=12, height = 7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_May_2_2023/dotplot_integrated_selectgenes_all_timepoints.svg", width=12, height = 7)
+
+p1+p2+p3
+```
+### Luo Genes Dotplot
+```{r}
+#Foxo1, Pi3k, and Nfkb , "Nfkb1", "Nfkb2", "Foxo1"), "Nfkb1", "Foxo1"
+DefaultAssay(pbmc.int) <- "RNA"
+
+
+markers.to.plot  <- genes
+ #pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+p1 <- DotPlot(subset(pbmc.int,orig.ident=="m2"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p1
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_m2.svg", width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_m2.png", width = 7, height=7)
+
+p1
+
+p2 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p2
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_m4.svg", width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_m4.png", width = 7, height=7)
+p2
+
+
+p3<- DotPlot(subset(pbmc.int,orig.ident=="m7"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p3
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_m7.svg", width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_m7.png", width = 7, height=7)
+
+p3
+
+
+p1+p2+p3
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_all_timepoints.png", width = 12, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_selected_genes_June_2023/dotplot_integrated_selectgenes_all_timepoints.svg", width = 12, height=7)
+
+p1+p2+p3
+
+```
+
+## compare individual  genes by time violin plot
+```{r}
+
+plots <- lapply(genes, function(x){
+  VlnPlot(object= pbmc.int, 
+  features = x, 
+  log=T,
+  split.by = "orig.ident", 
+  pt.size =0.3, 
+  combine = F)
+})
+
+lapply(plots, print)
+names(plots) <- genes
+
+#IGHV1-9
+# ighv1_9 <- VlnPlot(object= pbmc.int, 
+#   features = "Ighv1-9", 
+#   log=T,
+#   split.by = "orig.ident", 
+#   pt.size =0.0, 
+#   combine = F)
+# ighv1_9
+# ggsave("outs/figure_plots/violin_plots/Ighv1_9.svg",  device="svg")
+# ggsave("outs/figure_plots/violin_plots/Ighv1_9.png", device="png")
+
+```
+## save plots
+```{r}
+# save plots
+
+path <- file.path("outs/figure_plots/violin_plots")
+paths <- mapply(file.path, "outs/figure_plots/violin_plots", genes)
+paths_png<- lapply(paths, paste0, ".png")
+paths_svg <- lapply(paths, paste0, ".svg")
+names(paths_svg) <- paths_svg
+
+svg_p <- names(paths_svg)
+
+# lapply(names(plots), 
+#        function(x) ggsave(filename=file.path("outs/figure_plots/violin_plots", paste(x,".svg",sep="")), plot=plots[[x]]))
+
+#mapply(ggsave, svg_p, plots, device="svg")
+
+#mapply( function(x,y){ggsave(filename=x, plot=y, device="svg")}, svg_p, plots)
+#wrap_plots(plots = plots, ncol = 1)
+
+
+
+for(i in 1:length(plots)){
+  print(plots[[i]])
+  ggsave(file.path(path, paste(genes[[i]], ".svg")), device="svg")
+}
+
+#ggsave(file.path(path, paste()))
+```
+# subset by cluster, select genes each timepoint p-values
+```{r}
+# genelist to calculate p values of (from violin plots)
+genes <- c("Bcl6","Myc" ,  "Ccnd2", "Ccr6" , "Hhex" , "Prdm1", "Xbp1" , "Irf4",  "Sdc1", "Ighv1-9" )
+
+x <- levels(Idents(pbmc.int)) # clusters 
+DefaultAssay(pbmc.int) <- "RNA" # default assay 
+
+# find markers for month 2 vs month 4 for each cluster
+mz <- lapply(x, function(x){FindMarkers(object=pbmc.int,
+                        features=genes,
+                        ident.1="m2",
+                        ident.2="m4",
+                        group.by="orig.ident", 
+                        subset.ident=x,
+                        min.cells.feature = 0,
+                        min.cells.group = 0,
+                        min.pct=0.000001,
+                        logfc.threshold = 0.0000001,
+                        test.use = "MAST")})
+names(mz) <- x
+#dir.create("outs/figure_plots/violin_plots/pvalues")
+
+# save p values (and logFC) for each gene in each cluster, month 2 vs month 4
+path <- file.path("outs/figure_plots/violin_plots/pvalues")
+paths <- lapply(x, function(x){file.path(path, paste0("m2_vs_m4_cluster_", x, ".csv"))})
+
+mapply(write.csv, mz, paths)
+
+# same for month 2 vs month 7
+mz2vs7 <- lapply(x, function(x){FindMarkers(object=pbmc.int,
+                        features=genes,
+                        ident.1="m2",
+                        ident.2="m7",
+                        group.by="orig.ident", 
+                        subset.ident=x,
+                        min.cells.feature = 0,
+                        min.cells.group = 0,
+                       min.pct=0.001,
+                        logfc.threshold = 0.0000001,
+                        test.use = "MAST")})
+names(mz2vs7) <- x
+# write to paths
+paths <- lapply(x, function(x){file.path(path, paste0("m2_vs_m7_cluster_", x, ".csv"))})
+
+mapply(write.csv, mz2vs7, paths)
+
+
+# same for month 4 vs month 7
+mz4vs7 <- lapply(x, function(x){FindMarkers(object=pbmc.int,
+                        features=genes,
+                        ident.1="m4",
+                        ident.2="m7",
+                        group.by="orig.ident", 
+                        subset.ident=x,
+                        min.cells.feature = 0,
+                        min.cells.group = 0,
+                        min.pct=0.001,
+                        logfc.threshold = 0.0000001,
+                        test.use = "MAST")})
+names(mz4vs7) <- x
+# write to paths
+paths <- lapply(x, function(x){file.path(path, paste0("m4_vs_m7_cluster_", x, ".csv"))})
+
+mapply(write.csv, mz4vs7, paths)
+```
+
+
+
+## compare DZ/LZ/GZ by time
+
+## Myc by DZ/LZ/GZ by timepoints
+
+# variable regions are IGHV1-9, ***IGHV1-26, IGHV1-64, IGHV1-69, and IGHV1-81
+```{r}
+# Identify all cells at all timepoints that express selected V1 regions
+genes <- c("Ighv1-9","Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81")
+
+# plot with cells expressing selected variable regions highlighted
+g <- FeaturePlot(pbmc.int, features = genes, min.cutoff = "q9", split.by = "orig.ident")
+g
+
+# save png file
+ggsave("outs/selected_v_chains/expression_umap_plots/selected_variable_region_umap_by_time.png", plot=g, device="png", width=12, height=12)
+# save svg 
+ggsave("outs/selected_v_chains/expression_umap_plots/selected_variable_region_umap_by_time.svg", plot=g, device="svg", width=12, height=12)
+
+
+g
+```
+ 
+## Identify by variable region
+```{r}
+#Object.subset <- subset(Object, GeneX > 0 & GeneY > 0 & GeneZ > 0)
+## "Ighv1-9"  "Ighv1-26" "Ighv1-64" "Ighv1-69" "Ighv1-81"
+#(pbmc.int) <- "RNA"
+# vchains <- lapply(genes, function(x,y){
+#   subset(y, x>0)
+# }, pbmc.int["RNA"])
+
+
+v19 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-9`>0)), "v_chain"="Ighv1-9")
+v126 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-26`>0)), "v_chain"="Ighv1-26")
+v164 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-64`>0)), "v_chain"="Ighv1-64")
+v169 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-69`>0)), "v_chain"="Ighv1-69")
+v181 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-81`>0)), "v_chain"="Ighv1-81")
+
+
+pbmc.int@meta.data$v_chain <- "other"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v19$barcode), "v_chain"] <- "Ighv1-9"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v126$barcode), "v_chain"] <- "Ighv1-26"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v164$barcode), "v_chain"] <- "Ighv1-64"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v169$barcode), "v_chain"] <- "Ighv1-69"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v181$barcode), "v_chain"] <- "Ighv1-81"
+
+
+```
+
+## Differentially expressed genes by cells expressing selected v-chains
+```{r}
+# Find differentially expressed features between individual vchains and others
+
+ pbmc.int@meta.data$v_chain <- as.factor(pbmc.int@meta.data$v_chain)
+ 
+ Idents(pbmc.int) <- pbmc.int@meta.data$v_chain
+ genes <- c("Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81", "Ighv1-9")
+ 
+ 
+ gene.de.markers <- lapply(genes, function(x) {
+   FindMarkers(object=pbmc.int,
+               ident.1=x,
+               logfc.threshold=0.05,
+               test.use="MAST")})
+ names(gene.de.markers) <- genes
+ View(gene.de.markers)
+ 
+ 
+ # filter by adjusted p-value
+ genes.de.markers.filtered <- lapply(gene.de.markers, filter, p_val_ad<0.05)
+ 
+ # save differential gene expression data
+ #dir.create("outs/selected_v_chains/pbmc.int_de")
+ paths <- mapply(file.path, "outs/selected_v_chains/differential_expression_by_vchain_csv/pbmc.int_de", lapply(genes, paste0, ".csv"))
+ 
+ mapply(write.csv, genes.de.markers.filtered, paths)
+
+```
+
+## subset by time
+### pbmc.m2
+```{r}
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+
+ DefaultAssay(pbmc.m2) <- "RNA"
+
+# Find differentially expressed features between individual vchains and others
+
+ pbmc.m2@meta.data$v_chain <- as.factor(pbmc.m2@meta.data$v_chain)
+ 
+ Idents(pbmc.m2) <- pbmc.m2@meta.data$v_chain
+ genes <- c("Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81", "Ighv1-9")
+ 
+ 
+ gene.de.markers <- lapply(genes, function(x) {
+   FindMarkers(object=pbmc.m2,
+               ident.1=x,
+               logfc.threshold=0.05,
+               test.use="MAST")})
+ names(gene.de.markers) <- genes
+ View(gene.de.markers)
+ 
+ genes.de.markers.filtered <- lapply(gene.de.markers, filter, p_val_adj<0.05)
+ 
+ 
+ #dir.create("outs/selected_v_chains/differential_expression_by_vchain_csv/pbmc.m2_de")
+ paths <- mapply(file.path, "outs/selected_v_chains/differential_expression_by_vchain_csv/pbmc.m2_de", lapply(genes, paste0, ".csv"))
+ 
+ mapply(write.csv, genes.de.markers.filtered, paths)
+
+```
+
+### pbmc.m4
+```{r}
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+
+DefaultAssay(pbmc.m4) <- "RNA"
+
+
+# Find differentially expressed features between individual vchains and others
+
+ pbmc.m4@meta.data$v_chain <- as.factor(pbmc.m4@meta.data$v_chain)
+ 
+ Idents(pbmc.m4) <- pbmc.m4@meta.data$v_chain
+ genes <- c("Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81", "Ighv1-9")
+ 
+ 
+ gene.de.markers <- lapply(genes, function(x) {
+   FindMarkers(object=pbmc.m4,
+               ident.1=x,
+               logfc.threshold=0.05,
+               test.use="MAST")})
+ names(gene.de.markers) <- genes
+ View(gene.de.markers)
+ 
+ genes.de.markers.filtered <- lapply(gene.de.markers, filter, p_val_adj<0.05)
+ 
+# dir.create("outs/selected_v_chains/differential_expression_by_vchain/pbmc.m4_de")
+ paths <- mapply(file.path, "outs/selected_v_chains/differential_expression_by_vchain_csv/pbmc.m4_de", lapply(genes, paste0, ".csv"))
+ 
+ mapply(write.csv, genes.de.markers.filtered, paths)
+```
+
+
+### pbmc.m7
+```{r}
+pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+ DefaultAssay(pbmc.m7) <- "RNA"
+
+# Find differentially expressed features between individual vchains and others
+
+ pbmc.m7@meta.data$v_chain <- as.factor(pbmc.m7$v_chain)
+
+ Idents(pbmc.m7) <- pbmc.m7@meta.data$v_chain
+ genes <- c("Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81", "Ighv1-9")
+
+
+ gene.de.markers <- lapply(genes, function(x) {
+   FindMarkers(object=pbmc.m7,
+               ident.1=x,
+               logfc.threshold=0.05,
+               test.use="MAST")})
+ names(gene.de.markers) <- genes
+ View(gene.de.markers)
+
+ genes.de.markers.filtered <- lapply(gene.de.markers, filter, p_val_adj<0.05)
+
+dir.create("outs/selected_v_chains/differential_expression_by_vchain_csv/pbmc.m7_de")
+ paths <- mapply(file.path, "outs/selected_v_chains/differential_expression_by_vchain_csv/pbmc.m7_de", lapply(genes, paste0, ".csv"))
+
+ mapply(write.csv, genes.de.markers.filtered, paths)
+ 
+ saveRDS(pbmc.int, "pbmc_int.RDS")
+```
+
+# Bubble plot of msigdb hallmark genesets by timepoints
+## Load seurat object for faster processing
+```{r}
+# load from saved RDS to save time
+pbmc.int <- readRDS("pbmc_int.RDS")
+
+Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+
+
+#fgsea package[90] on mSigDB hallmark gene sets55 (v7.0, collection H)
+```
+
+## Hallmark GSEA by timepoints
+```{r}
+
+# all_gene_sets = msigdbr(species = "Mus musculus")
+# head(all_gene_sets)
+
+# hallmark genesets
+h_gene_sets = msigdbr(species = "mouse", category = "H")
+head(h_gene_sets)
+
+# selected hallmark genesets
+sets <- c("HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+"HALLMARK_FATTY_ACID_METABOLISM",
+"HALLMARK_GLYCOLYSIS",
+"HALLMARK_E2F_TARGETS",
+"HALLMARK_MYC_TARGETS_V2",
+"HALLMARK_MYC_TARGETS_V1",
+"HALLMARK_INTERFERON_ALPHA_RESPONSE",
+"HALLMARK_MTORC1_SIGNALING")
+# immune genesets
+cgp_gene_sets = msigdbr(species = "mouse", category = "C7", subcategory = "IMMUNESIGDB")
+head(cgp_gene_sets)
+
+# for fsgea
+## Get list of differentially expressed genes by cluster
+x <- levels(pbmc.m2)
+
+pbmc <- list(pbmc.m2, pbmc.m4, pbmc.m7)
+names(pbmc) <- c("m2", "m4", "m7")
+
+# get differentially expressed genes for each cluster (1 vs all) for each timepoine
+de.pbmc <- lapply(pbmc, FindAllMarkers, test.use="MAST") 
+de.pbmc <- lapply(de.pbmc, filter, p_val_adj < 0.05)
+de.pbmc <- lapply(de.pbmc, mutate, plog = -log(p_val)*avg_log2FC)
+
+# save and reload for future use to save time
+saveRDS(de.pbmc, "de_pbmc_list.RDS") 
+de.pbmc <- readRDS("de_pbmc_list.RDS")
+
+```
+
+### Month 2
+```{r}
+## hallmark
+msigdbr_df <- h_gene_sets
+msigdbr_list = split(x = msigdbr_df$gene_symbol, f = msigdbr_df$gs_name)
+
+de.m2 <- as.data.frame(de.pbmc[["m2"]])
+
+
+# results by cluster
+x <- levels(pbmc.m2)
+de.m2.cl <- lapply(x, function(x){filter(de.m2, cluster==x)})
+names(de.m2.cl) <- x
+
+de.m2.cl <- lapply(de.m2.cl, arrange, desc(avg_log2FC))
+
+#m2_c0 <- de.m2.cl[["0"]][,c("gene", "plog")]
+m2_genes <- lapply(de.m2.cl, function(x){y=select(x, avg_log2FC)})
+
+m2_genes_ls <- lapply(m2_genes, function(x){
+                            z <- (x[,"avg_log2FC"])
+                            names(z) <- rownames(x)
+                            return(z)})
+
+# Month 2 fgsea results for each cluster
+fgseaRes <- lapply(m2_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2 <- lapply(fgseaRes, as.data.frame)
+y <- lapply(x, paste0, "_cluster")
+
+names(fgseaRes.2) <- y
+
+fgseaRes.2 <- lapply(fgseaRes, select, 1:7)
+
+path <- file.path("outs", "pathways", "msigdb_hallmark", "month2")
+paths <- lapply(x, function(x){
+                file.path(path, paste0("M2_pathways_cluster_",x,".csv"))
+})
+
+names(paths) <- paths
+
+sapply(names(fgseaRes.2), 
+ function (x) write.csv(fgseaRes.2[[x]], file=file.path(path, paste0(x, "_cluster_pathways.csv"))) )
+```
+#### plot m2
+
+```{r}
+# library(clusterProfiler)
+# library(enrichplot)
+
+fgseaRes.2 <- lapply(fgseaRes.2, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+  filter(pval<0.05)})
+
+g <- lapply(fgseaRes.2, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=NES)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient2(low="blue", mid="white", high = "red") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots")       
+csvs <- lapply(x, paste0, "_gsea_msighallmark.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+
+
+### Month 4 
+```{r}
+de.m4 <- as.data.frame(de.pbmc[["m4"]])
+
+
+
+# results by cluster
+x <- levels(pbmc.m4)
+de.m4.cl <- lapply(x, function(x){filter(de.m4, cluster==x)})
+names(de.m4.cl) <- x
+
+de.m4.cl <- lapply(de.m4.cl, arrange, desc(avg_log2FC))
+
+#m4_c0 <- de.m4.cl[["0"]][,c("gene", "plog")]
+m4_genes <- lapply(de.m4.cl, function(x){y=select(x, avg_log2FC)})
+
+m4_genes_ls <- lapply(m4_genes, function(x){
+                            z <- (x[,"avg_log2FC"])
+                            names(z) <- rownames(x)
+                            return(z)})
+
+
+
+
+# Month 2 fgsea results for each cluster
+fgseaRes <- lapply(m4_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2 <- lapply(fgseaRes, as.data.frame)
+y <- lapply(x, paste0, "_cluster")
+
+names(fgseaRes.2) <- y
+
+fgseaRes.2 <- lapply(fgseaRes, select, 1:7)
+
+path <- file.path("outs", "pathways", "msigdb_hallmark", "month4")
+
+
+sapply(names(fgseaRes.2), 
+ function (x) write.csv(fgseaRes.2[[x]], file=file.path(path, paste0(x, "_cluster_pathways_m4.csv"))) )
+
+```
+
+#### plot m4
+
+```{r}
+# library(clusterProfiler)
+# library(enrichplot)
+
+fgseaRes.2 <- lapply(fgseaRes.2, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+  filter(pval<0.05)})
+
+g <- lapply(fgseaRes.2, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=NES)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient2(low="blue", mid="white", high = "red") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots")       
+dir.create(png_outs)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+
+
+
+### Month 7
+```{r}
+de.m7 <- as.data.frame(de.pbmc[["m7"]])
+
+
+# results by cluster
+x <- levels(pbmc.m7)
+de.m7.cl <- lapply(x, function(x){filter(de.m7, cluster==x)})
+names(de.m7.cl) <- x
+
+de.m7.cl <- lapply(de.m7.cl, arrange, desc(avg_log2FC))
+
+#m7_c0 <- de.m7.cl[["0"]][,c("gene", "plog")]
+m7_genes <- lapply(de.m7.cl, function(x){y=select(x, avg_log2FC)})
+
+m7_genes_ls <- lapply(m7_genes, function(x){
+                            z <- (x[,"avg_log2FC"])
+                            names(z) <- rownames(x)
+                            return(z)})
+
+
+# Month 7 fgsea results for each cluster
+fgseaRes <- lapply(m7_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2 <- lapply(fgseaRes, as.data.frame)
+y <- lapply(x, paste0, "_cluster")
+
+names(fgseaRes.2) <- y
+
+fgseaRes.2 <- lapply(fgseaRes, select, 1:7)
+
+path <- file.path("outs", "pathways", "msigdb_hallmark", "month7")
+
+
+sapply(names(fgseaRes.2), 
+ function (x) write.csv(fgseaRes.2[[x]], file=file.path(path, paste0(x, "_cluster_pathways_m7.csv"))) )
+
+```
+
+#### plot m7
+
+```{r}
+# library(clusterProfiler)
+# library(enrichplot)
+
+fgseaRes.2 <- lapply(fgseaRes.2, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+  filter(pval<0.05)})
+
+g <- lapply(fgseaRes.2, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=NES)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient2(low="blue", mid="white", high = "red") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots") 
+dir.create(png_outs)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+### All months
+```{r}
+## hallmark
+msigdbr_df <- h_gene_sets
+msigdbr_list = split(x = msigdbr_df$gene_symbol, f = msigdbr_df$gs_name)
+
+x <- levels(pbmc.m2)
+
+fgseaRes <- lapply(m2_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2.m2 <- lapply(fgseaRes, as.data.frame)
+fgseaRes.2.m2 <- lapply(fgseaRes.2.m2, add_column, time="m2")
+
+
+
+fgseaRes <- lapply(m4_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2.m4 <- lapply(fgseaRes, as.data.frame)
+fgseaRes.2.m4 <- lapply(fgseaRes.2.m4, add_column, time="m4")
+
+fgseaRes <- lapply(m7_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2.m7 <- lapply(fgseaRes, as.data.frame)
+fgseaRes.2.m7 <- lapply(fgseaRes.2.m7, add_column, time="m7")
+
+# combine
+res <- Map(bind_rows , fgseaRes.2.m2, fgseaRes.2.m4, fgseaRes.2.m7)
+
+
+
+```
+
+#### plot all timepoints
+
+```{r}
+# library(clusterProfiler)
+# library(enrichplot)
+
+# res <- lapply(res, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+#   filter(pval<0.05)})
+
+res <- lapply(res, function(x){mutate(x, neg_log= -log10(pval))})
+
+g <- lapply(res, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=time)) +
+  geom_bar(stat="identity", position = "dodge", width=0.7) +
+  #scale_fill_gradient2(palette="Paired") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots")    
+dir.create(path)
+csvs <- lapply(x, paste0, "_gsea_msighallmark.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+
+
+## selected gene_sets
+```{r}
+sets <- c("HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+"HALLMARK_FATTY_ACID_METABOLISM",
+"HALLMARK_GLYCOLYSIS",
+"HALLMARK_E2F_TARGETS",
+"HALLMARK_MYC_TARGETS_V2",
+"HALLMARK_MYC_TARGETS_V1",
+"HALLMARK_INTERFERON_ALPHA_RESPONSE",
+"HALLMARK_MTORC1_SIGNALING")
+
+h_gene_sets_selected <- filter(h_gene_sets, gs_name %in% sets)
+
+
+```
+
+
+### Month 2
+```{r}
+## hallmark
+msigdbr_df <- h_gene_sets_selected
+msigdbr_list = split(x = msigdbr_df$gene_symbol, f = msigdbr_df$gs_name)
+
+
+
+# results by cluster
+x <- levels(pbmc.m2)
+de.m2.cl <- lapply(x, function(x){filter(de.m2, cluster==x)})
+names(de.m2.cl) <- x
+
+de.m2.cl <- lapply(de.m2.cl, arrange, desc(avg_log2FC))
+
+#m2_c0 <- de.m2.cl[["0"]][,c("gene", "plog")]
+m2_genes <- lapply(de.m2.cl, function(x){y=select(x, avg_log2FC)})
+
+m2_genes_ls <- lapply(m2_genes, function(x){
+                            z <- (x[,"avg_log2FC"])
+                            names(z) <- rownames(x)
+                            return(z)
+})
+
+# Month 2 fgsea results for each cluster
+fgseaRes <- lapply(m2_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2 <- lapply(fgseaRes, as.data.frame)
+y <- lapply(x, paste0, "_cluster")
+
+names(fgseaRes.2) <- y
+
+fgseaRes.2 <- lapply(fgseaRes, select, 1:7)
+
+#path <- file.path("outs", "pathways", "msigdb_hallmark", "month2")
+
+
+path <- file.path("outs/pathways/msigdb_hallmark/hallmark_selected", "month2")
+dir.create(path, recursive = T)
+#names(paths) <- paths
+
+sapply(names(fgseaRes.2), 
+ function (x) write.csv(fgseaRes.2[[x]], file=file.path(path, paste0(x, "_cluster_pathways.csv"))) )
+```
+
+### Plot M2 selected hallmark pathways
+```{r}
+fgseaRes.2 <- lapply(fgseaRes.2, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+  filter(pval<0.05)})
+
+g <- lapply(fgseaRes.2, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=NES)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient2(low="blue", mid="white", high = "red") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots") 
+dir.create(png_outs)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+
+
+### Month 4
+```{r}
+de.m4 <- as.data.frame(de.pbmc[["m4"]])
+
+# results by cluster
+x <- levels(pbmc.m4)
+de.m4.cl <- lapply(x, function(x){filter(de.m4, cluster==x)})
+names(de.m4.cl) <- x
+
+de.m4.cl <- lapply(de.m4.cl, arrange, desc(avg_log2FC))
+
+#m4_c0 <- de.m4.cl[["0"]][,c("gene", "plog")]
+m4_genes <- lapply(de.m4.cl, function(x){y=select(x, avg_log2FC)})
+
+m4_genes_ls <- lapply(m4_genes, function(x){
+                            z <- (x[,"avg_log2FC"])
+                            names(z) <- rownames(x)
+                            return(z)
+})
+
+# Month 2 fgsea results for each cluster
+fgseaRes <- lapply(m4_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2 <- lapply(fgseaRes, as.data.frame)
+y <- lapply(x, paste0, "_cluster")
+
+names(fgseaRes.2) <- y
+
+fgseaRes.2 <- lapply(fgseaRes, select, 1:7)
+
+path <- file.path("outs/pathways/msigdb_hallmark/hallmark_selected", "month4")
+dir.create(path, recursive = T)
+
+sapply(names(fgseaRes.2), 
+ function (x) write.csv(fgseaRes.2[[x]], file=file.path(path, paste0(x, "_cluster_pathways_m4.csv"))) )
+
+```
+#### Plot m4
+```{r}
+fgseaRes.2 <- lapply(fgseaRes.2, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+  filter(pval<0.05)})
+
+g <- lapply(fgseaRes.2, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=NES)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient2(low="blue", mid="white", high = "red") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots") 
+dir.create(png_outs)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+
+
+
+### Month 7
+```{r}
+de.m7 <- as.data.frame(de.pbmc[["m7"]])
+
+# results by cluster
+x <- levels(pbmc.m7)
+de.m7.cl <- lapply(x, function(x){filter(de.m7, cluster==x)})
+names(de.m7.cl) <- x
+
+de.m7.cl <- lapply(de.m7.cl, arrange, desc(avg_log2FC))
+
+#m7_c0 <- de.m7.cl[["0"]][,c("gene", "plog")]
+m7_genes <- lapply(de.m7.cl, function(x){y=select(x, avg_log2FC)})
+
+m7_genes_ls <- lapply(m7_genes, function(x){
+                            z <- (x[,"avg_log2FC"])
+                            names(z) <- rownames(x)
+                            return(z)
+})
+
+# Month 2 fgsea results for each cluster
+fgseaRes <- lapply(m7_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2 <- lapply(fgseaRes, as.data.frame)
+y <- lapply(x, paste0, "_cluster")
+
+names(fgseaRes.2) <- y
+
+fgseaRes.2 <- lapply(fgseaRes, select, 1:7)
+
+path <- file.path("outs/pathways/msigdb_hallmark/hallmark_selected", "month7")
+dir.create(path, recursive = T)
+
+sapply(names(fgseaRes.2), 
+ function (x) write.csv(fgseaRes.2[[x]], file=file.path(path, paste0(x, "_cluster_pathways_m7.csv"))) )
+
+```
+#### Plot m4
+```{r}
+fgseaRes.2 <- lapply(fgseaRes.2, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+  filter(pval<0.05)})
+
+g <- lapply(fgseaRes.2, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=NES)) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient2(low="blue", mid="white", high = "red") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots") 
+dir.create(png_outs)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+### All months
+```{r}
+## hallmark
+msigdbr_df <- h_gene_sets_selected
+msigdbr_list = split(x = msigdbr_df$gene_symbol, f = msigdbr_df$gs_name)
+
+x <- levels(pbmc.m2)
+
+fgseaRes <- lapply(m2_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2.m2 <- lapply(fgseaRes, as.data.frame)
+fgseaRes.2.m2 <- lapply(fgseaRes.2.m2, add_column, time="m2")
+
+
+
+fgseaRes <- lapply(m4_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2.m4 <- lapply(fgseaRes, as.data.frame)
+fgseaRes.2.m4 <- lapply(fgseaRes.2.m4, add_column, time="m4")
+
+fgseaRes <- lapply(m7_genes_ls, function(x){
+                      fgsea(pathways=msigdbr_list,
+                             stats=x,
+                             minSize=15,
+                             maxSize=500)
+})
+
+fgseaRes.2.m7 <- lapply(fgseaRes, as.data.frame)
+fgseaRes.2.m7 <- lapply(fgseaRes.2.m7, add_column, time="m7")
+
+# combine
+res <- Map(bind_rows , fgseaRes.2.m2, fgseaRes.2.m4, fgseaRes.2.m7)
+
+
+
+```
+
+#### plot all timepoints
+
+```{r}
+# library(clusterProfiler)
+# library(enrichplot)
+
+# res <- lapply(res, function(x){mutate(x, neg_log= -log10(pval)) %>% 
+#   filter(pval<0.05)})
+
+res <- lapply(res, function(x){mutate(x, neg_log= -log10(pval))})
+
+g <- lapply(res, function(x){ggplot(x, mapping=aes( x=reorder(pathway, (neg_log)),y= neg_log, fill=time)) +
+  geom_bar(stat="identity", position = "dodge", width=0.7) +
+  #scale_fill_gradient2(palette="Paired") +
+    geom_hline(yintercept=-log10(0.05), linetype=2)+
+      coord_flip()})
+g
+
+
+# save figures
+png_outs <- file.path(path, "plots")    
+dir.create(path)
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.png") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="png", width=7, height=7)
+
+csvs <- lapply(x, paste0, "_gsea_msighallmark_selected.svg") %>% lapply(function(x) file.path(png_outs, x))
+
+mapply(ggsave, csvs, g, device="svg", width=7, height=7)
+```
+
+# Geneset enrichment
+
+```{r}
+# pbmc.int <- readRDS("pbmc_int.RDS")
+# Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+# pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+# pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+# pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+
+# Read genelist of associated paper
+## genes from Laidlaw et al., 2020, PMCID 7442689
+## table from Immunity, Risley et al (under review)
+#library(readxl)
+Risley_Immunity_table_s2 <- readxl::read_excel("Risley_Immunity_table_s2.xlsx")
+#View(Risley_Immunity_table_s2)
+
+genes_lz <- Risley_Immunity_table_s2[,1]
+names(genes_lz) <- "light_zone"
+
+genes_lz <- filter(genes_lz, is.na(genes_lz$light_zone) == FALSE)
+#genes_lz <- genes_lz$light_zone
+lz <- list(genes_lz$light_zone)
+
+genes_dz <- Risley_Immunity_table_s2[,2]
+names(genes_dz) <- "dark_zone"
+
+dz <- list(genes_dz$dark_zone)
+
+
+path <- file.path("outs", "figure_plots", "GC_zones_enrichment")
+
+```
+## Light Zone
+```{r}
+# add module scores
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=lz,
+            name="light_zone",
+            assay="RNA",
+            search=T
+            )
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.int,
+            features = "light_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "light_zone_integrated.svg"), width=7, height=7)
+ggsave(file.path(path,"light_zone_integrated.png"), width=7, height=7)
+```
+
+### Light Zone M2
+```{r}
+
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+
+
+# Plot scores
+#colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.m2,
+            features = "light_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "light_zone_m2.svg"), width=7, height=7)
+ggsave(file.path(path,"light_zone_m2.png"), width=7, height=7)
+```
+
+### Light Zone M4
+```{r}
+# add module scores
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.m4,
+            features = "light_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "light_zone_m4.svg"), width=7, height=7)
+ggsave(file.path(path,"light_zone_m4.png"), width=7, height=7)
+```
+
+### Light Zone m7
+```{r}
+# add module scores
+pbmc.m7  <- subset(pbmc.int, orig.ident=="m7")
+
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.m7,
+            features = "light_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "light_zone_m7.svg"), width=7, height=7)
+
+ggsave(file.path(path,"light_zone_m7.png"), width=7, height=7)
+```
+
+### Boxplot
+```{r}
+df <- as.data.frame(pbmc.int@meta.data)
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=light_zone1, fill=orig.ident))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+p1
+ggsave(file.path(path, "light_zone_boxplots_separate_timepoints.png"), width=21, height=7)
+ggsave(file.path(path, "light_zone_boxplots_separate_timepoints.svg"), width=21, height=7)
+
+```
+
+## Dark Zone
+```{r}
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=dz,
+            name="dark_zone",
+            assay="RNA",
+            search=T
+            )
+
+# Plot scores
+FeaturePlot(pbmc.int,
+            features = "dark_zone1", label = TRUE, repel = TRUE) + colors
+path <- file.path("outs", "figure_plots", "GC_zones_enrichment")
+
+ggsave(file.path(path, "dark_zone_integrated.svg"), width=7, height=7)
+ggsave(file.path(path,"dark_zone_integrated.png"), width=7, height=7)
+```
+#### Boxplot by month
+```{r}
+df <- as.data.frame(pbmc.int@meta.data)
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=dark_zone1, fill=orig.ident))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+p1
+ggsave(file.path(path, "dark_zone_boxplots_separate_timepoints.png"), width=21, height=7)
+ggsave(file.path(path, "dark_zone_boxplots_separate_timepoints.svg"), width=21, height=7)
+```
+
+### dark Zone M2
+```{r}
+
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+
+
+# Plot scores
+#colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.m2,
+            features = "dark_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "dark_zone_m2.svg"), width=7, height=7)
+ggsave(file.path(path,"dark_zone_m2.png"), width=7, height=7)
+```
+
+### dark Zone M4
+```{r}
+# add module scores
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.m4,
+            features = "dark_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "dark_zone_m4.svg"), width=7, height=7)
+ggsave(file.path(path,"dark_zone_m4.png"), width=7, height=7)
+```
+
+### dark Zone m7
+```{r}
+# add module scores
+pbmc.m7  <- subset(pbmc.int, orig.ident=="m7")
+
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.m7,
+            features = "dark_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+ggsave(file.path(path, "dark_zone_m7.svg"), width=7, height=7)
+
+ggsave(file.path(path,"dark_zone_m7.png"), width=7, height=7)
+```
+
+
+#	Clustering by mouse (we have integrated per timepoint at 03 resolution, but need mouse-by-mouse)
+## clustering by mouse
+```{r}
+### example
+p1 <- DimPlot(pbmc.m2, reduction = "umap", split.by = "mouse_id", label=T)
+p2 <- DimPlot(pbmc.m4, reduction = "umap", split.by = "mouse_id",label = TRUE)
+p3 <- DimPlot(pbmc.m7, reduction = "umap", split.by = "mouse_id",label = TRUE)
+p1 / p2 / p3
+p1
+p2
+p3
+p2/p3
+
+
+DimPlot(pbmc.int, reduction = "umap", split.by = "mouse_id", label=T)
+
+```
+
+
+#	Bubble plot of our IGHVs of interest across clusters over time (IGHV1-9, IGHV1-26, IGHV1-64, IGHV1-69, and IGHV1-81)
+```{r}
+
+markers.to.plot  <- c("Ighv1-9", "Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81")
+ #pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+p1 <- DotPlot(pbmc.m2, features = rev(markers.to.plot), cols = c("blue","red"),dot.scale = 8) + RotatedAxis()
+p2 <- DotPlot(pbmc.m4, features = rev(markers.to.plot), cols = c("blue","red"),dot.scale = 8) + RotatedAxis()
+p3 <- DotPlot(pbmc.m7, features = rev(markers.to.plot), cols = c("blue","red"),dot.scale = 8) + RotatedAxis()
+
+p1 + p2 + p3
+path <- file.path("outs/selected_v_chains", "v_chain_by_cluster_dotplots")
+ggsave(file.path(path, "dotplot_integrated_select_variable_regions_all_timepoints.svg"), width=12, height=7)
+```
+
+#	Bubble plot of genes of interest (Bcl6, Myc, Ccnd2, Ccr6, Hhex, Prdm1, Xbp1, Irf4, and Sdc1)
+## Plot genes from LUO paper list
+## Load Data
+```{r}
+pbmc.int <- readRDS("pbmc_int.RDS")
+Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+```
+
+## genelist for dotplots
+```{r}
+genes <- c("Bcl6", "Myc", "Ccnd2", "Ccr6", "Hhex", "Prdm1", "Xbp1", "Irf4", "Sdc1","Ighv1-9")
+
+```
+
+## Plot genelist for Luo genes
+```{r}
+#Foxo1, Pi3k, and Nfkb , "Nfkb1", "Nfkb2", "Foxo1"), "Nfkb1", "Foxo1"
+DefaultAssay(pbmc.int) <- "RNA"
+
+
+markers.to.plot  <- genes
+ #pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+p1 <- DotPlot(subset(pbmc.int,orig.ident=="m2"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p1
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_m2.svg", device="svg",width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_m2.png", width = 7, height=7)
+
+p1
+
+p2 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p2
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_m4.svg", width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_m4.png", width = 7, height=7)
+p2
+
+
+p3<- DotPlot(subset(pbmc.int,orig.ident=="m7"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p3
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_m7.svg", width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_m7.png", width = 7, height=7)
+
+p3
+
+p4<- DotPlot(pbmc.int, features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+p4
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_integrated.svg", width = 7, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_integrated.png", width = 7, height=7)
+
+
+p1+p2+p3
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_all_timepoints.svg", width = 21, height=7)
+ggsave("outs/figure_plots/dotplots_by_cluster_luo_genelist/Bcl6_Myc_Ccnd2_Ccr6_Hhex_Prdm1_Xbp1_Irf4_Sdc1_Ighv1-9_all_timepoints.png", width = 21, height=7)
+
+p1+p2+p3
+
+```
+
+
+#	GSEA of MYC targets 
+## Load Data
+```{r}
+# pbmc.int <- readRDS("pbmc_int.RDS")
+# Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+# pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+# pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+# pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+
+library(nichenetr)
+# read in Myc pathway genes
+growth_sigs <- readRDS("prCancer_sigs.RDS")
+
+myc_dn <- unlist(growth_sigs$myc_dn) %>% nichenetr::convert_human_to_mouse_symbols() %>% 
+  na.omit() %>%  list()
+
+
+myc_up <- unlist(growth_sigs$myc_up) %>% nichenetr::convert_human_to_mouse_symbols() %>% 
+  na.omit() %>% 
+  list()
+
+akt_75 <- unlist(growth_sigs$akt_75) %>% nichenetr::convert_human_to_mouse_symbols() %>% 
+  na.omit() %>% 
+  list()
+
+akt_20_up <- unlist(growth_sigs$akt_20_up) %>% nichenetr::convert_human_to_mouse_symbols() %>% 
+  na.omit() %>% 
+  list()
+
+akt_20_dn <- unlist(growth_sigs$akt_20_dn) %>% nichenetr::convert_human_to_mouse_symbols() %>% 
+  na.omit() %>% 
+  list()
+
+rock2 <- list(c("Sqle",
+              "Hmgcs1",
+              "Hmgcr",
+              "Idi1",
+              "Lss",
+              "Ccrl2",
+              "Ccr9",
+              "Gpr55",
+              "S1pr1",
+              "Gpr34",
+              "Calcrl",
+              "Ptafr",
+              "Adrb2",
+              "Gpr19",
+              "Hrh2",
+              "Gpr132",
+              "Ccr6",
+              "Ccr7",
+              "Ccr1",
+              "Gpr183",
+              "Cxcr3",
+              "Sorcs2",
+              "Ptger4",
+              "Gpr146",
+              "Ffar2",
+              "Pkd1l3",
+              "Adora2a",
+              "Lancl1",
+              "Gpr157",
+              "Lpar5",
+              "S1pr4",
+              "Fzd5",
+              "Gprc5b",
+              "Ccr6",
+              #"Gp183",
+              "Ccr7",
+              "Il9r",
+              "Itgam"))
+
+
+# z <- rownames(pbmc.int)
+# z[which(unlist(rock2) %in% z)]
+# 
+# missing_dz <- unlist(rock2)[!(unlist(rock2) %in% z)]
+# missing_dz
+# path to store plots
+path <- file.path("outs/figure_plots", "myc_rock2_enrichment")
+```
+
+### get signature scores
+```{r}
+myc <- list(unlist(append(myc_up, myc_dn)))
+
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=myc_dn,
+            name="myc_dn",
+            assay="RNA",
+            search=T
+            )
+
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=myc_up,
+            name="myc_up",
+            assay="RNA",
+            search=T
+            )
+
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=myc_up,
+            name="myc",
+            assay="RNA",
+            search=T
+            )
+
+pbmc.int <-  AddModuleScore(object=pbmc.int,
+            features=rock2,
+            name="rock2",
+            assay="RNA",
+            search=T
+            )
+
+pbmc.int <-  AddModuleScore(object=pbmc.int,
+            features=akt_75,
+            name="akt_75",
+            assay="RNA",
+            search=T
+            )
+
+pbmc.int <-  AddModuleScore(object=pbmc.int,
+            features=akt_20_up,
+            name="akt_20_up",
+            assay="RNA",
+            search=T
+            )
+
+pbmc.int <-  AddModuleScore(object=pbmc.int,
+            features=akt_20_dn,
+            name="akt_20_dn",
+            assay="RNA",
+            search=T
+            )
+
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+p1 <- FeaturePlot(pbmc.int,
+            features = "myc_up1", label = TRUE, repel = TRUE) +
+            colors
+p2 <- FeaturePlot(pbmc.int,
+            features = "myc_dn1", label = TRUE, repel = TRUE) +
+            colors
+p3 <- FeaturePlot(pbmc.int,
+            features = "myc1", label = TRUE, repel = TRUE) +
+            colors
+p1
+# save plots
+
+
+ggsave(file.path(path, "myc_up_integrated.svg"),width=7, height=7)
+ggsave(file.path(path,"myc_up_integrated.png"),width=7, height=7)
+write.csv(as.data.frame(myc_up), file.path(path, "myc_up.csv"))
+
+p2
+ggsave(file.path(path, "myc_dn_integrated.svg"),width=7, height=7)
+ggsave(file.path(path,"myc_dn_integrated.png"),width=7, height=7)
+write.csv(as.data.frame(myc_dn), file.path(path, "myc_dn.csv"))
+
+
+p1
+p2
+p3
+```
+
+# Boxplot of average myc gsea score by cluster
+```{r}
+# group by cluster gsea scores
+df <- pbmc.int@meta.data
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_up1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p2 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_dn1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+p3 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p1 / p2/p3
+
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_integrated.png"), width=21, height= 14)
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_integrated.svg"), width=21, height= 14)
+```
+
+# M2 Boxplot of average myc gsea score by cluster
+```{r}
+# group by cluster gsea scores
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+df <- pbmc.m2@meta.data
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_up1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p2 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_dn1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+p3 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p1 / p2/p3
+
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_m2.png"), width=21, height= 14)
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_m2.svg"), width=21, height= 14)
+```
+
+# m4 Boxplot of average myc gsea score by cluster
+```{r}
+# group by cluster gsea scores
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+df <- pbmc.m4@meta.data
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_up1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p2 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_dn1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+p3 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p1 / p2/p3
+
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_m4.png"), width=21, height= 14)
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_m4.svg"), width=21, height= 14)
+```
+
+# m7 Boxplot of average myc gsea score by cluster
+```{r}
+# group by cluster gsea scores
+pbmc.m7<- subset(pbmc.int, orig.ident=="m7")
+df <- pbmc.m7@meta.data
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_up1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p2 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc_dn1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+p3 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=myc1, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p1 / p2/p3
+
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_m7.png"), width=21, height= 14)
+ggsave(file.path(path, "myc_up_dn_combined_boxplot_gsea-scores_m7.svg"), width=21, height= 14)
+```
+
+
+#	GSEA of ROCK2 targets 
+```{r}
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+
+p2 <- FeaturePlot(pbmc.int,
+            features = "rock21", label = TRUE, repel = TRUE) +
+            colors
+
+p3 <- FeaturePlot(pbmc.int,
+            features = "akt_20_up1", label = TRUE, repel = TRUE) +
+            colors
+p3
+p4 <- FeaturePlot(pbmc.int,
+            features = "akt_20_dn1", label = TRUE, repel = TRUE) +
+            colors
+p4
+
+
+p2
+ggsave(file.path(path, "rock2_enrichment_umap.svg"), device="svg", width=7, height=7)
+write.csv(as.data.frame(rock2), file.path(path, "rock2_genes.csv"))
+
+p3
+ggsave(file.path(path, "akt_20_up_enrichment_umap.svg"), device="svg", width=7, height=7)
+write.csv(as.data.frame(akt_20_up), file.path(path, "akt_20_up.csv"))
+
+p4
+ggsave(file.path(path, "akt_20_dn_enrichment_umap.svg"), device="svg", width=7, height=7)
+write.csv(as.data.frame(akt_20_dn), file.path(path, "akt_20_dn.csv"))
+
+p2+p3+p4
+```
+
+
+# Boxplot of average rock2 gsea score by cluster
+```{r}
+# group by cluster gsea scores
+df <- pbmc.int@meta.data
+
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=rock21, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p1 
+
+ggsave(file.path(path, "rock2_boxplot_gsea-scores_integrated.png"), width=21, height= 7)
+ggsave(file.path(path, "rock2_boxplot_gsea-scores_integrated.svg"), width=21, height= 7)
+```
+
+# Timepoint Boxplot of average rock2 gsea score by cluster
+```{r}
+# group by cluster gsea scores
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+df <- pbmc.m2@meta.data
+
+p1 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=rock21, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+df <- pbmc.m4@meta.data
+
+p2 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=rock21, fill=integrated_snn_res.0.5))) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+df <- pbmc.m7@meta.data
+
+p3 <- ggplot(df, mapping=(aes(x=integrated_snn_res.0.5, y=rock21, fill=integrated_snn_res.0.5))) +
+  geom_boxplot()+
+  theme(legend.position = "none")
+
+p1 / p2/p3
+
+ggsave(file.path(path, "rock2_boxplot_gsea-scores_all_timepoints.png"), width=21, height= 14)
+ggsave(file.path(path, "rock2__boxplot_gsea-scores_all_timepoints.svg"), width=21, height= 14)
+```
+
+# LZ vs DZ analysis
+```{r}
+# Read data
+pbmc.int <- readRDS("pbmc_int.RDS")
+
+# change Grey zone to NA; only have Light zone or dark zone or NA
+pbmc.int@meta.data[which(pbmc.int@meta.data$Germinal_Center=="Grey_Zone"), "Germinal_Center"] <- NA
+
+unique(pbmc.int@meta.data$Germinal_Center)
+
+pbmc.int@meta.data$Germinal_Center <- as.factor(pbmc.int@meta.data$Germinal_Center)
+```
+
+## Differential genes
+## Selected genes dotplots
+## Selected IgV regions dotplots
+## Pathway analysis GSEA
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+
+
