@@ -1,0 +1,2391 @@
+---
+title: "SLE_LZ-DZ_singlecell"
+author: "Arthur VanValkenburg"
+date: "2022-09-02"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(sva)
+  library(SingleCellExperiment)
+  library(DESeq2)
+  library(TBSignatureProfiler)
+  library(DT)
+  library(enrichR)
+  library(Rtsne)
+  library(umap)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(tidyverse)
+  library(knitr)
+  library(kableExtra)
+  library(Seurat)
+  library(SeuratObject)
+  library(patchwork)
+  library(cowplot)
+  library(RColorBrewer)
+  library(plotly)
+  library(msigdbr)
+  library(fgsea)
+  library(data.table)
+
+  
+})
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load data
+```{r}
+#umap_proj <- read.csv("cd4_umap_projection.csv")
+path_2m <- file.path("2_month/outs/multi/count/raw_feature_bc_matrix")
+path_4m <- file.path("4_month/outs/multi/count/raw_feature_bc_matrix")
+path_7m <- file.path("7_month/outs/multi/count/raw_feature_bc_matrix")
+
+path_ls <- list(path_2m, path_4m, path_7m)
+
+
+# Load the PBMC dataset
+pbmc.data <- lapply(path_ls, Read10X)
+
+
+# Initialize the Seurat object with the raw (non-normalized data).
+pbmc.m2 <- CreateSeuratObject(counts = pbmc.data[[1]]$`Gene Expression`, project = "m2", min.cells = 3, min.features = 200)
+#Add antibody capture data to seurat object (and mouse info)
+pbmc.m2[["ADT"]] <- CreateAssayObject(pbmc.data[[1]][["Antibody Capture"]][, colnames(x = pbmc.m2)])
+
+pbmc.m4 <- CreateSeuratObject(counts = pbmc.data[[2]]$`Gene Expression`, project = "m4", min.cells = 3, min.features = 200)
+#Add antibody capture data to seurat object (and mouse info)
+pbmc.m4[["ADT"]] <- CreateAssayObject(pbmc.data[[2]][["Antibody Capture"]][, colnames(x = pbmc.m4)])
+
+pbmc.m7 <- CreateSeuratObject(counts = pbmc.data[[3]]$`Gene Expression`, project = "m7", min.cells = 3, min.features = 200)
+#Add antibody capture data to seurat object (and mouse info)
+pbmc.m7[["ADT"]] <- CreateAssayObject(pbmc.data[[3]][["Antibody Capture"]][, colnames(x = pbmc.m7)])
+
+# get rid of 2 cells with missing hash
+pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+
+# change mouse label
+pbmc.m2$mouse_id <- pbmc.m2$nFeature_ADT
+pbmc.m2$mouse_id <- gsub("1", "mouse1", pbmc.m2$mouse_id)
+pbmc.m2$mouse_id <- gsub("2", "mouse3", pbmc.m2$mouse_id)
+
+pbmc.m4$mouse_id <- pbmc.m4$nFeature_ADT
+pbmc.m4$mouse_id <- gsub("1", "mouse1", pbmc.m4$mouse_id)
+pbmc.m4$mouse_id <- gsub("2", "mouse2", pbmc.m4$mouse_id)
+pbmc.m4$mouse_id <- gsub("3", "mouse3", pbmc.m4$mouse_id)
+
+pbmc.m7$mouse_id <- pbmc.m7$nFeature_ADT
+pbmc.m7$mouse_id <- gsub("1", "mouse1", pbmc.m7$mouse_id)
+pbmc.m7$mouse_id <- gsub("2", "mouse2", pbmc.m7$mouse_id)
+pbmc.m7$mouse_id <- gsub("3", "mouse3", pbmc.m7$mouse_id)
+
+
+# remove objects to save memory
+rm(pbmc.data)
+```
+# M2
+## QC 
+```{r}
+pbmc <- pbmc.m2
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+
+
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+### Plot
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+```
+### Filtering
+```{r}
+
+#pbmc.1 <- subset(pbmc, subset=nCount_RNA >200 & nCount_RNA < 4500 & percent.mt < 8 )
+# Filter from Loupe object; removes NAs
+pbmc <- subset(pbmc, subset=nCount_RNA>200  & nFeature_RNA < 6500 & nCount_RNA < 45000 & percent.mt < 30 )
+# 
+table(pbmc$mouse_id)
+```
+
+#### Filtering graphs
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+
+```
+
+
+
+## Normalize data
+VST function calculates a variance stabilizing transformation (VST) from the fitted dispersion-mean relation(s) and then transforms the count data (normalized by division by the size factors or normalization factors), yielding a matrix of values which are now approximately homoskedastic (having constant variance along the range of mean values). The transformation also normalizes with respect to library size. The rlog is less sensitive to size factors, which can be an issue when size factors vary widely. These transformations are useful when checking for outliers or as input for machine learning techniques such as clustering or linear discriminant analysis.
+## Normalize and Find Top Variable genes
+```{r}
+#https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize") %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) 
+
+pbmc <- NormalizeData(pbmc, assay = "ADT", normalization.method = "CLR")
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+## Ridgeplot of mouse ID's
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+RidgePlot(pbmc, assay = "ADT", features = rownames(pbmc[["ADT"]]), ncol = 2)
+
+```
+## Scale Data and run clustering
+```{r}
+
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes) %>% 
+  RunPCA(features = VariableFeatures(object = pbmc), verbose = FALSE) %>% 
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, verbose = FALSE) %>%
+  RunTSNE() %>%
+  RunUMAP(dims = 1:30) 
+  
+
+```
+
+## PCA
+### Top genes in principle components
+```{r}
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+### Genes in first 2 dimensions
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+```
+
+### PCA Plot
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+DimPlot(pbmc, reduction = "pca")
+```
+
+## Dimension heatmap
+```{r}
+DimHeatmap(pbmc, dims = 1:3, cells = 500, balanced = TRUE) # demonstrate the cells with the most heterogeneity
+```
+
+
+## Determine the ‘dimensionality’ of the dataset
+### JackStraw Plot
+```{r}
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+
+
+### Elbow Plot 
+```{r}
+ElbowPlot(pbmc)
+```
+
+
+
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+
+
+## Clustering
+
+```{r}
+pbmc <- FindNeighbors(pbmc, dims=1:20)
+```
+```{r}
+
+pbmc <- FindClusters(pbmc, resolution=c(0.1, 0.3, 0.5, 0.7, 1))
+
+```
+
+## Plot clusters {.tabset}
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.1", label=T)
+```
+
+### Resolution 0.3
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.3", label=T)
+```
+### Resolution 0.5
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.5", label=T)
+```
+### Resolution 0.7
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.7", label=T)
+```
+### Resolution 1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.1", label=T)
+```
+
+## Zone Genelists
+```{r}
+gene_dz <- c(	"Arhgap45",
+              "Arhgef1",
+              "Cd79b",
+              "Sipa1",
+              "Arhgap4",
+              "Helz2",
+              "Pax5",
+              "Itpr3",
+              "Pik3cd",
+              "H2-Ob",
+              "Safb2",
+              "Siglecg",
+              "Neil1",
+              "Syk",	
+              "Coro1a",
+              "Prrc2a",
+              "Slc1a5",
+              "Syvn1")
+
+# gene_gz <- c( #"Rn45s",
+#             	"Mki67",
+#             	"Lars2",
+#             	"Ncapd2",
+#             	"Top2a",
+#             	"Incenp",
+#             	"Tuba1c",
+#             	"Cdca5",
+#             	"Ccnb1",
+#             	"Cdk1",
+#             	"Birc5",
+#             	"Bub3")
+# 	
+
+gene_lz <- c("Myc",
+          	"Mycbp2",
+          	"H2-Eb1",
+          	"Rps3",
+          	"Eef1a1",
+          	"Ptpn6",
+          	"Myh9",
+          	"Swap70",
+          	"Pfn1",
+          	"Atp5b",
+          	#"NCI",
+          	"Cd74",
+          	"Actb",
+          	"Cd22",
+          	"Hsp90ab1",
+          	"Eef2",
+          	#"Rrpl4",
+          	"Eef1a1",
+          	"Rack1")
+	
+
+all(gene_dz %in% rownames(pbmc))
+all(gene_lz %in% rownames(pbmc))
+#all(gene_gz %in% rownames(pbmc))
+
+z <- rownames(pbmc)
+#z[which(gene_dz %in% z)]
+
+missing_dz <- gene_dz[!(gene_dz %in% z)]
+missing_dz
+z[grep("ARHGAP45", ignore.case = T, z)]
+#"Arhgap45"
+z[grep("CD79b", ignore.case = T, z)]
+#"Cd79b"
+missing_lz <- gene_lz[!(gene_lz %in% z)] #Gnb2l1="Rack1"; 
+missing_lz #"Gnb2l1":"Rack1"; "NCI":unkonwn;    "CD74":Cd74;   "Rrpl4";unknown
+z[grep("Rrpl4", ignore.case = T, z)]
+
+
+# missing_gz <- gene_gz[!(gene_gz %in% z)]
+# missing_gz #"Rn45s"
+# z[grep("Rn45s", ignore.case = T, z)]
+
+```
+## Identify genes in clusters
+## Dark zone first 6 genes
+```{r}
+FeaturePlot(pbmc, features = gene_dz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_dz[10:18], min.cutoff = "q9")
+```
+
+
+## Light zone
+```{r}
+FeaturePlot(pbmc, features = gene_lz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_lz[10:17], min.cutoff = "q9")
+```
+
+
+## Grey zone
+```{r}
+#FeaturePlot(pbmc, features = gene_gz[1:11], min.cutoff = "q9")
+```
+## Dotplot of genes per cluster {.tabset}
+### Dark Zone
+```{r}
+Idents(pbmc) <- pbmc$RNA_snn_res.0.3
+markers.to.plot <- unique(gene_dz)
+DotPlot(pbmc, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+
+```
+### Light Zone
+```{r}
+markers.to.plot <- unique(gene_lz)
+DotPlot(pbmc, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+
+```
+
+### Grey Zone
+```{r}
+# markers.to.plot <- unique(gene_gz)
+# DotPlot(pbmc, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+
+```
+Clusters 7, 12, and 13 seem to be grey zone B cells, with 7 and 12 extremely close in the UMAP
+
+## Violin Plots
+## Dark Zone
+```{r}
+plots <- VlnPlot(pbmc, features = gene_dz,  
+    pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 1)
+```
+## Light Zone
+```{r}
+plots <- VlnPlot(pbmc, features = gene_lz,  
+    pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 1)
+```
+
+## Grey Zone
+```{r}
+# plots <- VlnPlot(pbmc, features = gene_gz,  
+#     pt.size = 0, combine = FALSE)
+# wrap_plots(plots = plots, ncol = 1)
+```
+
+## Differential Expression
+```{r}
+# list options for groups to perform differential expression on
+levels(pbmc)
+#Idents(pbmc) <- pbmc$mouse_id
+```
+
+
+
+
+
+
+
+```{r}
+# individual mouse barcodes
+# path <- file.path("2_month/outs/")
+# path_h5 <- file.path("2_month/outs/multi/count/")
+# mat <- readSingleCellMatrix(file.path(path, "matrix.mtx.gz"))
+# 
+# barcodes <- read_tsv(file.path(path,'barcodes.tsv.gz'), col_names =FALSE)
+# features <- read_tsv(file.path(path,'features.tsv.gz'), col_names = FALSE)
+
+# M1 <- "AAAGCATTCTTCACG"
+# M2 <- "GAGTCTGCCAGTATC"
+# M3 <- "TGCCTATGAAACAAG"
+
+pbmc.m2 <- pbmc
+
+```
+
+
+# M4
+## QC
+```{r}
+pbmc <- pbmc.m4
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+
+
+#
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+### Plots
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+```
+### Filtering
+```{r}
+#pbmc.1 <- subset(pbmc, subset=nCount_RNA >200 & nCount_RNA < 4500 & percent.mt < 8 )
+# Filter from Loupe object; removes NAs
+pbmc <- subset(pbmc, subset=nCount_RNA>200  & nFeature_RNA < 6500 & nCount_RNA < 45000 & percent.mt < 20 )
+# 
+
+table(pbmc$mouse_id)
+```
+
+### Filtering graphs
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+#ggsave(file.path(path, "postfilter_violin_feature_count_percent-mt_m4.svg"), width=7, height=7)
+
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+```
+
+
+
+## Normalize data
+VST function calculates a variance stabilizing transformation (VST) from the fitted dispersion-mean relation(s) and then transforms the count data (normalized by division by the size factors or normalization factors), yielding a matrix of values which are now approximately homoskedastic (having constant variance along the range of mean values). The transformation also normalizes with respect to library size. The rlog is less sensitive to size factors, which can be an issue when size factors vary widely. These transformations are useful when checking for outliers or as input for machine learning techniques such as clustering or linear discriminant analysis.
+### Normalize and Find Top Variable genes
+```{r}
+#https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize") %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) 
+
+pbmc <- NormalizeData(pbmc, assay = "ADT", normalization.method = "CLR")
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+## Ridgeplot of mouse ID's
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+RidgePlot(pbmc, assay = "ADT", features = rownames(pbmc[["ADT"]]), ncol = 2)
+
+```
+## Scale Data and run clustering
+```{r}
+
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes) %>% 
+  RunPCA(features = VariableFeatures(object = pbmc), verbose = FALSE) %>% 
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, verbose = FALSE) %>%
+  RunTSNE() %>%
+  RunUMAP(dims = 1:30) 
+  
+
+```
+
+## PCA
+### Top genes in principle components
+```{r}
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+### Genes in first 2 dimensions
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+```
+
+### PCA Plot
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+DimPlot(pbmc, reduction = "pca")
+```
+
+### Dimension heatmap
+From the tutorial: In particular DimHeatmap() allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting cells to a number plots the ‘extreme’ cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.
+```{r}
+DimHeatmap(pbmc, dims = 1:3, cells = 500, balanced = TRUE) # demonstrate the cells with the most heterogeneity
+```
+
+
+## Determine the ‘dimensionality’ of the dataset
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a ‘null distribution’ of feature scores, and repeat this procedure. We identify ‘significant’ PCs as those who have a strong enrichment of low p-value features.
+
+The JackStrawPlot() function provides a visualization tool for comparing the distribution of p-values for each PC with a uniform distribution (dashed line). ‘Significant’ PCs will show a strong enrichment of features with low p-values (solid curve above the dashed line). In this case it appears that there is a sharp drop-off in significance after the first 10-12 PCs.
+### JackStraw Plot
+```{r}
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+
+
+### Elbow Plot 
+```{r}
+ElbowPlot(pbmc)
+```
+
+
+### top 10 genes
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+### Variable features plot
+```{r}
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+```
+
+
+## Clustering
+
+Seurat v3 applies a graph-based clustering approach, building upon initial strategies in (Macosko et al). Importantly, the distance metric which drives the clustering analysis (based on previously identified PCs) remains the same. However, our approach to partitioning the cellular distance matrix into clusters has dramatically improved. Our approach was heavily inspired by recent manuscripts which applied graph-based clustering approaches to scRNA-seq data [SNN-Cliq, Xu and Su, Bioinformatics, 2015] and CyTOF data [PhenoGraph, Levine et al., Cell, 2015]. Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected ‘quasi-cliques’ or ‘communities’.
+
+As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs).
+
+To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [SLM, Blondel et al., Journal of Statistical Mechanics], to iteratively group cells together, with the goal of optimizing the standard modularity function. The FindClusters() function implements this procedure, and contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the Idents() function.
+### Clusters
+
+```{r}
+pbmc <- FindNeighbors(pbmc, dims=1:20)
+```
+```{r}
+pbmc <- FindClusters(pbmc, resolution=c(0.1, 0.3, 0.5, 0.7, 1))
+```
+
+## Plot clusters {.tabset}
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.1", label=T)
+```
+
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.3", label=T)
+```
+### Resolution 0.5
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.5", label=T)
+```
+### Resolution 0.7
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.7", label=T)
+```
+### Resolution 1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.1", label=T)
+```
+
+## Zone Genelists
+```{r}
+gene_dz <- c(	"Arhgap45",
+              "Arhgef1",
+              "Cd79b",
+              "Sipa1",
+              "Arhgap4",
+              "Helz2",
+              "Pax5",
+              "Itpr3",
+              "Pik3cd",
+              "H2-Ob",
+              "Safb2",
+              "Siglecg",
+              "Neil1",
+              "Syk",	
+              "Coro1a",
+              "Prrc2a",
+              "Slc1a5",
+              "Syvn1")
+
+gene_gz <- c( #"Rn45s",
+            	"Mki67",
+            	"Lars2",
+            	"Ncapd2",
+            	"Top2a",
+            	"Incenp",
+            	"Tuba1c",
+            	"Cdca5",
+            	"Ccnb1",
+            	"Cdk1",
+            	"Birc5",
+            	"Bub3")
+	
+
+gene_lz <- c("Myc",
+          	"Mycbp2",
+          	"H2-Eb1",
+          	"Rps3",
+          	"Eef1a1",
+          	"Ptpn6",
+          	"Myh9",
+          	"Swap70",
+          	"Pfn1",
+          	"Atp5b",
+          	#"NCI",
+          	"Cd74",
+          	"Actb",
+          	"Cd22",
+          	"Hsp90ab1",
+          	"Eef2",
+          	#"Rrpl4",
+          	"Eef1a1",
+          	"Rack1")
+	
+
+all(gene_dz %in% rownames(pbmc))
+all(gene_lz %in% rownames(pbmc))
+all(gene_gz %in% rownames(pbmc))
+
+z <- rownames(pbmc)
+#z[which(gene_dz %in% z)]
+
+missing_dz <- gene_dz[!(gene_dz %in% z)]
+missing_dz
+z[grep("ARHGAP45", ignore.case = T, z)]
+#"Arhgap45"
+z[grep("CD79b", ignore.case = T, z)]
+#"Cd79b"
+missing_lz <- gene_lz[!(gene_lz %in% z)] #Gnb2l1="Rack1"; 
+missing_lz #"Gnb2l1":"Rack1"; "NCI":unkonwn;    "CD74":Cd74;   "Rrpl4";unknown
+z[grep("Rrpl4", ignore.case = T, z)]
+
+
+missing_gz <- gene_gz[!(gene_gz %in% z)]
+missing_gz #"Rn45s"
+z[grep("Rn45s", ignore.case = T, z)]
+
+```
+## Identify genes in clusters
+## Dark zone first 6 genes
+```{r}
+FeaturePlot(pbmc, features = gene_dz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_dz[10:18], min.cutoff = "q9")
+```
+
+
+## Light zone
+```{r}
+FeaturePlot(pbmc, features = gene_lz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_lz[10:17], min.cutoff = "q9")
+```
+
+## store m4 data
+```{r}
+pbmc.m4 <- pbmc
+```
+
+
+
+# QC
+```{r}
+pbmc <- pbmc.m7
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+
+
+#
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+```
+## plots
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+
+#ggsave(file.path(path, "prefilter_scatter_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+```
+## Filtering
+```{r}
+#pbmc.1 <- subset(pbmc, subset=nCount_RNA >200 & nCount_RNA < 4500 & percent.mt < 8 )
+# Filter from Loupe object; removes NAs
+pbmc <- subset(pbmc, subset=nCount_RNA>200  & nFeature_RNA < 6500 & nCount_RNA < 45000 & percent.mt < 30 )
+# 
+table(pbmc$mouse_id)
+```
+
+### Filtering graphs
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+#ggsave(file.path(path, "postfilter_violin_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+          geom_hline(yintercept=8) + 
+          geom_vline(xintercept = 8000) +
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+          geom_smooth(method="lm") +
+          geom_hline(yintercept=200) +
+          geom_hline(yintercept=6500) +
+          geom_vline(xintercept = 45000) + 
+          theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+plot1 + plot2
+#ggsave(file.path(path, "postfilter_scatter_feature_count_percent-mt_m7.svg"), width=7, height=7)
+
+```
+
+
+
+# Normalize data
+VST function calculates a variance stabilizing transformation (VST) from the fitted dispersion-mean relation(s) and then transforms the count data (normalized by division by the size factors or normalization factors), yielding a matrix of values which are now approximately homoskedastic (having constant variance along the range of mean values). The transformation also normalizes with respect to library size. The rlog is less sensitive to size factors, which can be an issue when size factors vary widely. These transformations are useful when checking for outliers or as input for machine learning techniques such as clustering or linear discriminant analysis.
+## Normalize and Find Top Variable genes
+```{r}
+#https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize") %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) 
+
+pbmc <- NormalizeData(pbmc, assay = "ADT", normalization.method = "CLR")
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 
+plot2
+```
+## Ridgeplot of mouse ID's
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+RidgePlot(pbmc, assay = "ADT", features = rownames(pbmc[["ADT"]]), ncol = 2)
+
+```
+## Scale Data and run clustering
+```{r}
+
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes) %>% 
+  RunPCA(features = VariableFeatures(object = pbmc), verbose = FALSE) %>% 
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters(resolution = 0.8, verbose = FALSE) %>%
+  RunTSNE() %>%
+  RunUMAP(dims = 1:30) 
+  
+
+```
+
+## PCA
+### Top genes in principle components
+```{r}
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+### Genes in first 2 dimensions
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+
+```
+
+### PCA Plot
+```{r}
+Idents(pbmc) <- pbmc$mouse_id
+DimPlot(pbmc, reduction = "pca")
+```
+
+### Dimension heatmap
+```{r}
+DimHeatmap(pbmc, dims = 1:3, cells = 500, balanced = TRUE) # demonstrate the cells with the most heterogeneity
+```
+
+
+## Determine the ‘dimensionality’ of the dataset
+
+### JackStraw Plot
+```{r}
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+pbmc <- JackStraw(pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:20)
+```
+
+
+### Elbow Plot 
+```{r}
+ElbowPlot(pbmc)
+```
+
+
+
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+
+```{r}
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+plot2
+```
+
+
+## Clustering
+
+
+### Clusters
+
+```{r}
+pbmc <- FindNeighbors(pbmc, dims=1:20)
+```
+```{r}
+pbmc <- FindClusters(pbmc, resolution=c(0.1, 0.3, 0.5, 0.7, 1))
+```
+
+### Plot clusters {.tabset}
+### Resolution 0.1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.1", label=T)
+```
+
+### Resolution 0.3
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.3", label=T)
+```
+### Resolution 0.5
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.5", label=T)
+```
+### Resolution 0.7
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.0.7", label=T)
+```
+### Resolution 1
+```{r}
+DimPlot(pbmc, group.by = "RNA_snn_res.1", label=T)
+```
+
+## Zone Genelists
+```{r}
+gene_dz <- c(	"Arhgap45",
+              "Arhgef1",
+              "Cd79b",
+              "Sipa1",
+              "Arhgap4",
+              "Helz2",
+              "Pax5",
+              "Itpr3",
+              "Pik3cd",
+              "H2-Ob",
+              "Safb2",
+              "Siglecg",
+              "Neil1",
+              "Syk",	
+              "Coro1a",
+              "Prrc2a",
+              "Slc1a5",
+              "Syvn1")
+
+# gene_gz <- c( #"Rn45s",
+#             	"Mki67",
+#             	"Lars2",
+#             	"Ncapd2",
+#             	"Top2a",
+#             	"Incenp",
+#             	"Tuba1c",
+#             	"Cdca5",
+#             	"Ccnb1",
+#             	"Cdk1",
+#             	"Birc5",
+#             	"Bub3")
+	
+
+gene_lz <- c("Myc",
+          	"Mycbp2",
+          	"H2-Eb1",
+          	"Rps3",
+          	"Eef1a1",
+          	"Ptpn6",
+          	"Myh9",
+          	"Swap70",
+          	"Pfn1",
+          	"Atp5b",
+          	#"NCI",
+          	"Cd74",
+          	"Actb",
+          	"Cd22",
+          	"Hsp90ab1",
+          	"Eef2",
+          	#"Rrpl4",
+          	"Eef1a1",
+          	"Rack1")
+	
+
+all(gene_dz %in% rownames(pbmc))
+all(gene_lz %in% rownames(pbmc))
+#all(gene_gz %in% rownames(pbmc))
+
+z <- rownames(pbmc)
+#z[which(gene_dz %in% z)]
+
+missing_dz <- gene_dz[!(gene_dz %in% z)]
+missing_dz
+z[grep("ARHGAP45", ignore.case = T, z)]
+#"Arhgap45"
+z[grep("CD79b", ignore.case = T, z)]
+#"Cd79b"
+missing_lz <- gene_lz[!(gene_lz %in% z)] #Gnb2l1="Rack1"; 
+missing_lz #"Gnb2l1":"Rack1"; "NCI":unkonwn;    "CD74":Cd74;   "Rrpl4";unknown
+z[grep("Rrpl4", ignore.case = T, z)]
+
+
+# missing_gz <- gene_gz[!(gene_gz %in% z)]
+# missing_gz #"Rn45s"
+# z[grep("Rn45s", ignore.case = T, z)]
+
+```
+## Identify genes in clusters
+### Dark zone first 6 genes
+```{r}
+FeaturePlot(pbmc, features = gene_dz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_dz[10:18], min.cutoff = "q9")
+```
+
+
+### Light zone
+```{r}
+FeaturePlot(pbmc, features = gene_lz[1:9], min.cutoff = "q9")
+```
+```{r}
+FeaturePlot(pbmc, features = gene_lz[10:17], min.cutoff = "q9")
+```
+
+## store M7 data
+```{r}
+pbmc.m7 <- pbmc
+```
+## save processed objcets
+```{r}
+# saveRDS(pbmc.m2, "pbmc_m2.RDS")
+# saveRDS(pbmc.m4, "pbmc_m4.RDS")
+# saveRDS(pbmc.m7, "pbmc_m7.RDS")
+
+```
+
+
+# Combine Timepoints
+## Combining Seurat objects
+```{r}
+# integrate 3 experiments
+ls <- list(pbmc.m2, pbmc.m4, pbmc.m7)
+
+
+# make sure mouse_id includes timepoints
+
+
+immune.anchors <- FindIntegrationAnchors(object.list = ls,  reduction="rpca")
+
+pbmc.int <- IntegrateData(anchorset = immune.anchors)
+
+# clean
+rm(immune.anchors, ls, pbmc.m2, pbmc.m4, pbmc.m7, pbmc)
+```
+
+## Compare clusters by time
+```{r}
+DefaultAssay(pbmc.int) <- "integrated"
+
+
+# Run the standard workflow for visualization and clustering
+pbmc.int <- ScaleData(pbmc.int, verbose = FALSE)
+pbmc.int <- RunPCA(pbmc.int, npcs = 30, verbose = FALSE)
+# UMAP and Clustering
+pbmc.int <- RunUMAP(pbmc.int, reduction = "pca", dims = 1:20)
+pbmc.int <- FindNeighbors(pbmc.int, reduction = "pca", dims = 1:20)
+pbmc.int <- FindClusters(pbmc.int, resolution = 0.5)
+```
+
+### UMAP plots of integrated object
+```{r}
+# Visualization
+p1 <- DimPlot(pbmc.int, reduction = "umap", group.by = "orig.ident")
+p2 <- DimPlot(pbmc.int, reduction = "umap", label = TRUE)
+
+
+p2
+#ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_integrated.svg", plot=p2)
+p2
+
+plot_grid(p1, p2)
+
+```
+### UMAP plots of integrated object, separated by time
+Note: these will be different based on the computer and operating system used, although cells in each cluster will be the same.
+```{r}
+g <- DimPlot(pbmc.int, reduction = "umap", split.by = "orig.ident", label=T)
+g
+#ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_by_time_integrated.png")
+#ggsave("outs/figure_plots/Cluster_UMAP_res05_plots/Clusters_res_05_by_time_integrated.svg", device = "svg", width = 120, height = 60, units = "mm")
+g
+
+
+```
+
+
+### Dotplot of percentage cells within each cluster by time
+```{r}
+
+path <- file.path("outs/figure_plots/cell_population_by_cluster")
+dir.create(path)
+# DotPlot only does genes
+md <- pbmc.int@meta.data %>% as.data.table
+# the resulting md object has one "row" per cell
+
+## count the number of cells per unique combinations of "Sample" and "seurat_clusters"
+x <- md[, .N, by = c("orig.ident", "seurat_clusters")]%>% dcast(., orig.ident ~ seurat_clusters, value.var = "N")
+
+x <- column_to_rownames(x, var="orig.ident")
+y <- x/rowSums(x, na.rm=T)
+# #write.csv(y, file.path(path, "cell_percentage_by_cluster.csv"))
+# #write.csv(x, file.path(path, "cell_number_by_cluster.csv"))
+y <- rownames_to_column(y, var="time")
+
+
+z <- melt(y)
+colnames(z) <- c("time", "cluster", "percentage")
+
+ggplot(z, aes(x=cluster, y=time, size=percentage))+geom_point()
+#ggsave(file.path(path, "cell_percentage_dotplot.svg"),width=7, height=7, device="svg")
+#ggsave(file.path(path, "cell_percentage_dotplot.png"),width=7, height=7, device="png")
+
+
+
+
+```
+
+### Barplot of percentage cells within each cluster by time
+```{r}
+p <- ggplot(data=z, aes(x=cluster, y=percentage, fill=time)) +
+geom_bar(stat="identity", color="black", position=position_dodge())+
+  theme_minimal()
+
+# Use brewer color palettes
+p + scale_fill_brewer(palette="Blues")
+#ggsave(file.path(path, "cell_percentage_barplot.svg"),width=7, height=7, device="svg")
+#ggsave(file.path(path, "cell_percentage_barplot.png"),width=7, height=7, device="png")
+
+```
+
+
+### Find markers associated with each cluster
+```{r}
+cluster_markers <- FindAllMarkers(pbmc.int, test.use = "MAST")
+##write.csv(cluster_markers, "outs/cluster_markers_integrated_all.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# variable regions are IGHV1-9, ***IGHV1-26, IGHV1-64, IGHV1-69, and IGHV1-81
+
+ 
+## Identify by variable region
+```{r}
+
+# Identify all cells at all timepoints that express selected V1 regions
+genes <- c("Ighv1-9","Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81")
+
+
+## adding variable region family ID to metadata
+v19 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-9`>0)), "v_chain"="Ighv1-9")
+v126 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-26`>0)), "v_chain"="Ighv1-26")
+v164 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-64`>0)), "v_chain"="Ighv1-64")
+v169 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-69`>0)), "v_chain"="Ighv1-69")
+v181 <- data.frame("barcode"=colnames(subset(pbmc.int, `Ighv1-81`>0)), "v_chain"="Ighv1-81")
+
+
+pbmc.int@meta.data$v_chain <- "other"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v19$barcode), "v_chain"] <- "Ighv1-9"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v126$barcode), "v_chain"] <- "Ighv1-26"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v164$barcode), "v_chain"] <- "Ighv1-64"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v169$barcode), "v_chain"] <- "Ighv1-69"
+
+pbmc.int@meta.data[which(row.names(pbmc.int@meta.data) %in% v181$barcode), "v_chain"] <- "Ighv1-81"
+
+pbmc.int@meta.data$v_chain <- as.factor(pbmc.int@meta.data$v_chain)
+ 
+```
+
+
+
+
+
+
+# Geneset enrichment
+
+```{r}
+# Read genelist of associated paper
+## genes from Laidlaw et al., 2020, PMCID 7442689
+Laidlaw_Immunity_table_s2 <- readxl::read_excel("Laidlaw_Immunity_table_s2.xlsx")
+#View(Laidlaw_Immunity_table_s2)
+
+genes_lz <- Laidlaw_Immunity_table_s2[,1]
+names(genes_lz) <- "light_zone"
+
+genes_lz <- filter(genes_lz, is.na(genes_lz$light_zone) == FALSE)
+#genes_lz <- genes_lz$light_zone
+lz <- list(genes_lz$light_zone)
+
+genes_dz <- Laidlaw_Immunity_table_s2[,2]
+names(genes_dz) <- "dark_zone"
+
+dz <- list(genes_dz$dark_zone)
+
+```
+## Light Zone
+```{r}
+#pbmc.int <- JoinLayers(pbmc.int)
+Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+
+pbmc.int <- readRDS("pbmc_int.RDS")
+
+# add module scores
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=lz,
+            name="light_zone",
+            assay="RNA",
+            search=T
+            )
+
+# Plot scores
+colors <- scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+FeaturePlot(pbmc.int,
+            features = "light_zone1", label = TRUE, repel = TRUE) +
+            colors
+
+
+#ggsave(file.path(path, "light_zone_integrated.svg"), width=7, height=7)
+#ggsave(file.path(path,"light_zone_integrated.png"), width=7, height=7)
+```
+
+
+## Dark Zone
+```{r}
+pbmc.int <- AddModuleScore(object=pbmc.int,
+            features=dz,
+            name="dark_zone",
+            assay="RNA",
+            search=T
+            )
+
+# Plot scores
+FeaturePlot(pbmc.int,
+            features = "dark_zone1", label = TRUE, repel = TRUE) + colors
+path <- file.path("outs", "figure_plots", "GC_zones_enrichment")
+
+#ggsave(file.path(path, "dark_zone_integrated.svg"), width=7, height=7)
+#ggsave(file.path(path,"dark_zone_integrated.png"), width=7, height=7)
+```
+
+
+
+#	Bubble plot of genes of interest (Bcl6, Myc, Ccnd2, Ccr6, Hhex, Prdm1, Xbp1, Irf4, and Sdc1)
+## Plot genes from LUO paper list
+## Load Data
+```{r}
+#pbmc.int <- readRDS("pbmc_int.RDS")
+Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+```
+
+
+##	Bubble plot of our IGHVs of interest across clusters over time (IGHV1-9, IGHV1-26, IGHV1-64, IGHV1-69, and IGHV1-81)
+```{r}
+
+markers.to.plot  <- c("Ighv1-9", "Ighv1-26", "Ighv1-64", "Ighv1-69", "Ighv1-81")
+ #pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+p1 <- DotPlot(pbmc.m2, features = rev(markers.to.plot), cols = c("blue","red"),dot.scale = 8, scale.by="size", scale.max=30, col.min = -0.9) + RotatedAxis()
+p2 <- DotPlot(pbmc.m4, features = rev(markers.to.plot), cols = c("blue","red"),dot.scale = 8, scale.by="size", scale.max=30,col.min = -0.9) + RotatedAxis()
+p3 <- DotPlot(pbmc.m7, features = rev(markers.to.plot), cols = c("blue","red"),dot.scale = 8, scale.by="size", scale.max=30, col.min = -0.9) + RotatedAxis()
+
+p1 + p2 + p3
+path <- file.path("outs/selected_v_chains", "v_chain_by_cluster_dotplots")
+#ggsave(file.path(path, "dotplot_integrated_select_variable_regions_all_timepoints.svg"), width=12, height=7)
+```
+
+## Plot genelist for Luo genes
+```{r}
+genes <- c("Bcl6", "Myc", "Ccnd2", "Ccr6", "Hhex", "Prdm1", "Xbp1", "Irf4", "Sdc1")
+
+DefaultAssay(pbmc.int) <- "RNA"
+
+
+markers.to.plot  <- genes
+ #pbmc.m2 <- subset(pbmc.m2, nFeature_ADT != 0)
+p1 <- DotPlot(subset(pbmc.int,orig.ident=="m2"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+
+p2 <- DotPlot(subset(pbmc.int,orig.ident=="m4"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8) + RotatedAxis()
+
+
+### try to get 0-100% for all 3 plots
+p3<- DotPlot(subset(pbmc.int,orig.ident=="m7"), features = rev(markers.to.plot), cols = c("blue","red"), dot.scale = 8, scale.by = "size") + RotatedAxis()
+
+
+
+
+
+
+p1+p2+p3
+
+```
+
+
+
+# BCR analysis
+## Load Data
+```{r}
+library(scRepertoire)
+pbmc.int <- readRDS("pbmc_int.RDS")
+Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+# pbmc.m2 <- subset(pbmc.int, orig.ident=="m2")
+# pbmc.m4 <- subset(pbmc.int, orig.ident=="m4")
+# pbmc.m7 <- subset(pbmc.int, orig.ident=="m7")
+
+pbmc.m2 <- readRDS("pbmc_m2.RDS")
+pbmc.m4 <- readRDS("pbmc_m4.RDS")
+pbmc.m7 <- readRDS("pbmc_m7.RDS")
+
+```
+
+## Load clonotype and sequence data
+```{r}
+### function adapted from https://ucdavis-bioinformatics-training.github.io/2020-Advanced_Single_Cell_RNA_Seq/data_analysis/VDJ_Analysis_fixed
+path <- file.path("2_month/outs/per_sample_outs/Sample1/vdj_b")
+path <- file.path("4_month/outs/per_sample_outs/Sample2/vdj_b/filtered_contig_annotations.csv")
+path <- file.path("7_month/outs/per_sample_outs/Sample3/vdj_b/filtered_contig_annotations.csv")
+add_clonotype <- function(path, seurat_obj, type="b"){
+    bcr <- read.csv(file.path(path,"filtered_contig_annotations.csv"))
+bcr <- read.csv(file.path(path))
+
+    # Remove the -1 at the end of each barcode.
+    bcr$barcode <- gsub("-1", "-1_1", bcr$barcode)
+    # Subsets so only the first line of each barcode is kept,
+    # as each entry for given barcode will have same clonotype.
+    bcr <- bcr[!duplicated(bcr$barcode), ]
+
+    # Only keep the barcode and clonotype columns. 
+    # We'll get additional clonotype info from the clonotype table.
+    bcr <- bcr[,c("barcode", "raw_clonotype_id")]
+    names(bcr)[names(bcr) == "raw_clonotype_id"] <- "clonotype_id"
+
+    # Clonotype-centric info.
+    clono <- read.csv(file.path(path,"clonotypes.csv"))
+
+    # Slap the AA sequences onto our original table by clonotype_id.
+    bcr <- merge(bcr, clono[, c("clonotype_id", "cdr3s_aa")])
+    names(bcr)[names(bcr) == "cdr3s_aa"] <- "cdr3s_aa"
+
+    # Reorder so barcodes are first column and set them as rownames.
+    bcr <- bcr[, c(2,1,3)]
+    rownames(bcr) <- bcr[,1]
+    bcr[,1] <- NULL
+    colnames(bcr) <- paste(type, colnames(bcr), sep="_")
+    # Add to the Seurat object's metadata.
+    clono_seurat <- AddMetaData(object=pbmc.m2, metadata=bcr)
+    return(clono_seurat)
+}
+# 
+# s_balbc_pbmc <- add_clonotype("vdj_v1_mm_balbc_pbmc/vdj_v1_mm_balbc_pbmc_t_", s_balbc_pbmc, "t")
+# s_balbc_pbmc <- add_clonotype("vdj_v1_mm_balbc_pbmc/vdj_v1_mm_balbc_pbmc_b_", s_balbc_pbmc, "b")
+# head(s_balbc_pbmc[[]])
+```
+
+## scRepertoire
+```{r}
+s1 <- read.csv("2_month/outs/per_sample_outs/Sample1/vdj_b/filtered_contig_annotations.csv")
+s2 <- read.csv("4_month/outs/per_sample_outs/Sample2/vdj_b/filtered_contig_annotations.csv")
+s3 <- read.csv("7_month/outs/per_sample_outs/Sample3/vdj_b/filtered_contig_annotations.csv")
+
+contig_list <- list(s1, s2, s3)
+
+path <- file.path("outs/bcr_repertoire/")
+```
+
+
+## combine contig list
+```{r}
+combined <- combineBCR(contig_list,  samples  = c("m2", "m4", "m7"), 
+                ID = c("m2", "m4", "m7"))
+#combined.1 <- combined
+```
+
+## strip barcodes
+```{r}
+for (i in seq_along(combined)) {
+    combined[[i]] <- stripBarcode(combined[[i]], 
+                            column = 1, connector = "_", num_connects = 3)
+}
+
+# rename combined object
+names(combined) <- c("m2", "m4", "m7")
+
+
+combined$m2$barcode <- gsub("-1", "-1_1", combined$m2$barcode)
+combined$m4$barcode <- gsub("-1", "-1_2", combined$m4$barcode)
+combined$m7$barcode <- gsub("-1", "-1_3", combined$m7$barcode)
+
+```
+
+## Visualize Contigs
+cloneCall
+
+“gene” - use the VDJC genes comprising the TCR/Ig
+“nt” - use the nucleotide sequence of the CDR3 region
+“aa” - use the amino acid sequence of the CDR3 region
+“strict” - use the VDJC genes comprising the TCR/Ig + the nucleotide sequence of the CDR3 region. This is the proper definition of clonotype
+Important to note that the clonotype is called using the combination of genes or nt/aa CDR3 sequences for both loci. As of this implementation of scRepertoire, clonotype calling is not incorporating small variations within the CDR3 sequences. The gene approach will be the most sensitive, while the use of nt or aa moderately so, and the most specific for clonotypes being strict. Additionally, the clonotype call is trying to incorporate both loci, i.e, both TCRA and TCRB chains and if a single-cell barcode has multiple sequences identified (i.e., 2 TCRA chains expressed in one cell). Using the 10x approach, there is a subset of barcodes that only return one of the immune receptor chains, the unreturned chain is assigned an NA value.
+
+
+### Quantify Clonotypes
+The first function to explore the clonotypes is quantContig() to return the total or relative numbers of unique clonotypes.
+
+scale
+
+TRUE - relative percent of unique clonotypes scaled by the total size of the clonotype repertoire
+FALSE - Report the total number of unique clonotypes
+
+chain
+
+“both” for combined chain visualization
+“TRA”, “TRB”, “TRD”, “TRG”, “IGH” or “IGL” to select single chain
+```{r}
+## should add cluster variable from pbmc.int
+quantContig(combined, cloneCall="gene+nt", scale = T, chain= "both")
+
+#ggsave(file.path(path, "clonotypes_by_month_percent_unique.png"), width=7, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_percent_unique.svg"), width=7, height=7)
+
+```
+
+
+
+### Clonotype Abundance
+We can also examine the relative distribution of clonotypes by abundance. Here abundanceContig() will produce a line graph with a total number of clonotypes by the number of instances within the sample or run. Like above, we can also group this by vectors within the contig object using the group variable in the function.
+
+
+```{r}
+abundanceContig(combined, cloneCall = "gene", scale = F)
+
+#ggsave(file.path(path, "clonotypes_by_month_abundance_vs_number_line.png"), width=7, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_abundance_vs_number_line.svg"), width=7, height=7)
+## supp
+```
+
+###Length of Clonotypes
+We can look at the length distribution of the CDR3 sequences by calling the lengtheContig() function. Importantly, unlike the other basic visualizations, the cloneCall can only be “nt” or “aa”. Due to the method of calling clonotypes as outlined above, the length should reveal a multimodal curve, this is a product of using the NA for the unreturned chain sequence and multiple chains within a single barcode.
+
+chain
+
+“both” for combined chain visualization
+“TRA”, “TRB”, “TRD”, “TRG”, “IGH” or “IGL” to select single chain
+```{r}
+lengthContig(combined, cloneCall="aa", chain = "both") 
+
+#ggsave(file.path(path, "clonotypes_by_month_cdr3AA_length_distribution.png"), width=7, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_cdr3AA_length_distribution.svg"), width=7, height=7)
+
+```
+
+```{r}
+lengthContig(combined, cloneCall="nt", chain = "both") 
+
+#ggsave(file.path(path, "clonotypes_by_month_cdr3nt_length_distribution.png"), width=7, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_cdr3nt_length_distribution.svg"), width=7, height=7)
+
+```
+
+### Compare Clonotypes
+We can also look at clonotypes between samples and changes in dynamics by using the compareClonotypes() function.
+
+samples
+Can be used to isolate specific samples based on the name of the list element
+
+graph
+
+“alluvial” - graph imaged below
+“area” - graph by area of the respective clonotype
+number
+The top number of clonotypes to graph, this will be calculated based on the frequency of the individual sample. This can also be left blank.
+
+clonotypes
+Can be used to isolate specific clonotype sequences, ensure the call matches the sequences you would like to visualize.
+
+```{r}
+compareClonotypes(combined, 
+                  numbers = 10, 
+                  samples = c("m2", "m4", "m7"), 
+                  cloneCall="aa", 
+                  graph = "alluvial")
+
+#ggsave(file.path(path, "clonotypes_by_month_clonotype_proportion_thru_month_alluvial.png"), width=21, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_clonotype_proportion_thru_month_alluvial.svg"), width=21, height=7)
+
+```
+
+### Visualize Gene Usage
+Last of the basic analysis visualizations is the relative usage of genes of the TCR or BCR, using vizGenes().
+
+gene
+
+“V”
+“D”
+“J”
+“C”
+chain
+
+“TRB”
+“TRA”
+“TRG”
+“TRD”
+“IGH”
+“IGL”
+plot
+
+“bar” for a bar chart
+“heatmap” for a heatmap
+y.axis
+Variable to separate the counts along the y-axis
+
+scale
+
+TRUE to scale the graph by the number of genes per sample
+FALSE to report raw numbers
+order
+
+“gene” to order by gene name
+“variance” to order by the variance between the separate variable categories
+
+
+```{r}
+
+vizGenes(combined, gene = "V", 
+         chain = "IGH", 
+         plot = "bar", 
+         order = "variance", 
+         scale = TRUE)
+
+
+##ggsave() ### can we take top 8 and see where they fall in the clusters
+
+#ggsave(file.path(path, "clonotypes_by_month_IGH-V.png"), width=21, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_IGH-V.svg"), width=21, height=7)
+
+```
+
+```{r}
+vizGenes(combined, gene = "V", 
+         chain = "IGL", 
+         plot = "bar", 
+         order = "variance", 
+         scale = TRUE)
+
+#ggsave(file.path(path, "clonotypes_by_month_IGL-V.png"), width=21, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_IGL-V.svg"), width=21, height=7)
+
+```
+```{r}
+vizGenes(combined, gene = "C", 
+         chain = "IGH", 
+         plot = "bar", 
+         order = "variance", 
+         scale = TRUE)
+
+#ggsave(file.path(path, "clonotypes_by_month_IGH-C.png"), width=14, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_IGH-C.svg"), width=14, height=7)
+
+```
+
+```{r}
+
+vizGenes(combined, 
+         gene = "V", 
+         chain = "IGH", 
+         y.axis = "C", 
+         plot = "heatmap", 
+         scale = TRUE, 
+         order = "gene")
+
+### check to see if we can select specific v- genes
+```
+
+```{r}
+
+vizGenes(combined, 
+         gene = "V", 
+         chain = "IGL", 
+         y.axis = "C", 
+         plot = "heatmap", 
+         scale = TRUE, 
+         order = "gene")
+```
+
+
+### Clonal Space Homeostasis
+By examining the clonal space, we are effectively looking at the relative space occupied by clones at specific proportions. Another way to think about this would be thinking of the total immune receptor sequencing run as a measuring cup. In this cup, we will fill liquids of different viscosity - or a different number of clonal proportions. Clonal space homeostasis asks what percentage of the cup is filled by clones in distinct proportions (or liquids of different viscosity, to extend the analogy). The proportional cutpoints are set under the cloneType variable in the function and can be adjusted at baseline the bins are as follows:
+
+cloneTypes
+
+Rare = .0001
+Small = .001
+Medium = .01
+Large = .1
+Hyperexpanded = 1
+```{r}
+
+clonalHomeostasis(combined, cloneCall = "gene", 
+                  cloneTypes = c(Rare = 1e-04, 
+                                 Small = 0.001, 
+                                 Medium = 0.01, 
+                                 Large = 0.1, 
+                                 Hyperexpanded = 1))
+```
+```{r}
+clonalHomeostasis(combined, cloneCall = "aa")
+
+```
+### Clonal Proportion
+Like clonal space homeostasis above, clonal proportion acts to place clones into separate bins. The key difference is instead of looking at the relative proportion of the clone to the total, the clonalProportion() function will rank the clones by total number and place them into bins.
+
+The split represents the ranking of clonotypes by copy or frequency of occurrence, meaning 1:10 are the top 10 clonotypes in each sample. The default bins are under the split variable in the function and can be adjusted, but they are as follows at baseline.
+
+split
+
+10
+100
+1000
+10000
+30000
+100000
+
+```{r}
+clonalProportion(combined, cloneCall = "gene",
+                 split = c(10, 100, 1000, 10000, 30000, 1e+05)) 
+```
+
+```{r}
+clonalProportion(combined, cloneCall = "nt") 
+
+```
+
+### Overlap Analysis
+If you are interested in measures of similarity between the samples loaded into scRepertoire, using clonalOverlap() can assist in the visualization. Three methods currently can be performed in clonalOverlap() 1) overlap coefficient, 2) Morisita index, or 3) Jaccard index. The former is looking at the overlap of clonotypes scaled to the length of unique clonotypes in the smaller sample. The Morisita index is more complex, it is an ecological measure of the dispersion of individuals within a population, incorporating the size of the population. The Jaccard Similarity Index is very similar to the overlap coefficient - instead of using the length of the smaller sample, the denominator for the Jaccard Index is the union of the two comparisons, leading to a much smaller number.
+
+```{r}
+clonalOverlap(combined, 
+              cloneCall = "gene+nt", 
+              method = "morisita")
+```
+
+Another recent addition to scRepertoire is the ability to cluster the samples by the clone size distribution using clonesizeDistribution() adapted from the powerTCR R package. If using this function, please read and cite the respective citation to analyze the similarities of sample clone size distributions. In this function, method refers to the hierarchical clustering approach that will be based on.
+```{r}
+clonesizeDistribution(combined, 
+                      cloneCall = "gene+nt", 
+                      method="ward.D2")
+```
+### Diversity Analysis
+Diversity can also be measured for samples or by other variables. Diversity is calculated using five metrics: 1) Shannon, 2) inverse Simpson, 3) Chao1, 4) Abundance-based Coverage Estimator (ACE), and 5) inverse Pielou’s measure of species evenness. The former two are generally used to estimate baseline diversity and Chao/ACE indices are used to estimate the richness of the samples. New implementation of this function includes downsampling with 100 bootstraps (n.boots) using the minimum number of unique clonotypes, as a more robust diversity estimate.
+
+```{r}
+clonalDiversity(combined, 
+                cloneCall = "gene", 
+                group.by = "sample", 
+                x.axis = "ID", 
+                n.boots = 100)
+
+#ggsave(file.path(path, "clonotypes_by_month_diversity_index.png"), width=14, height=7)
+#ggsave(file.path(path, "clonotypes_by_month_diversity_index.svg"), width=14, height=7)
+```
+
+### Scatter Compare
+A number of users requested a visualization from the work of Wu, et al 2020, PMID: 32103181 that allows for the direct comparison of clonotypes between 2 samples. scatterClonotype() will organize two samples from the combineTCR/BCR product, count the relative clonotypes, and produce a scatter plot comparing the two samples.
+
+x.axis and y.axis
+Names of the list element to place on the x-axis and y-axis - so for example “PX_P” and “PX_T”
+
+dot.size
+
+“total” to display the total number of clones between the the x- and y-axis
+Name of the list element to use for size calculation
+graph
+
+“proportion” for the relative proportion the clonotype represents across all clonotypes
+“count” for the total count of clonotypes by sample
+
+```{r}
+scatterClonotype(combined, 
+                 cloneCall ="gene", 
+                 x.axis = "m2", 
+                 y.axis = "m4",
+                 dot.size = "total",
+                 graph = "proportion")
+```
+```{r}
+
+scatterClonotype(combined, 
+                 cloneCall ="gene", 
+                 x.axis = "m2", 
+                 y.axis = "m7",
+                 dot.size = "total",
+                 graph = "proportion")
+```
+```{r}
+
+scatterClonotype(combined, 
+                 cloneCall ="gene", 
+                 x.axis = "m7", 
+                 y.axis = "m4",
+                 dot.size = "total",
+                 graph = "proportion")
+```
+## Combine clonotype and seurat info
+```{r}
+
+
+# read in pbmc.int seurat object
+pbmc.int <- readRDS("pbmc_int.RDS")
+Idents(pbmc.int) <- pbmc.int$integrated_snn_res.0.5
+
+seurat <- combineExpression(combined, pbmc.int, 
+                  cloneCall="gene", 
+                  group.by = "sample", 
+                  proportion = FALSE, 
+                  cloneTypes=c(Single=1, Small=5, Medium=20, Large=100, Hyperexpanded=500))
+```
+
+
+```{r}
+
+colorblind_vector <- colorRampPalette(rev(c("#0D0887FF", "#47039FFF", 
+              "#7301A8FF", "#9C179EFF", "#BD3786FF", "#D8576BFF",
+              "#ED7953FF","#FA9E3BFF", "#FDC926FF", "#F0F921FF")))
+
+DimPlot(seurat, group.by = "orig.ident") + NoLegend() +
+    scale_color_manual(values=colorblind_vector(3)) + 
+    theme(plot.title = element_blank())
+
+```
+
+```{r}
+slot(seurat, "meta.data")$cloneType <- factor(slot(seurat, "meta.data")$cloneType, 
+                levels = c("Hyperexpanded (100 < X <= 500)", 
+                           "Large (20 < X <= 100)", 
+                            "Medium (5 < X <= 20)", 
+                            "Small (1 < X <= 5)", 
+                            "Single (0 < X <= 1)", NA))
+DimPlot(seurat, group.by = "cloneType", split.by="orig.ident") +
+    scale_color_manual(values = colorblind_vector(5), na.value="grey") + 
+  theme(plot.title = element_blank())
+
+##ggsave("outs/bcr_repertoire/clonotype_distribution_by_month_umap.png", width=7, height=7)
+```
+### clonalOverlay
+Using the dimensional reduction graphs as a reference, we can also generate an overlay of the position of clonally expanded cells using clonalOverlay(). Select the reduction for the visualization, default is “PCA” and the freq.cutpoint or lowest clonal frequency or proportion to generate the contour plot. We can modify the contours by selecting the number of bins or number of contours drawn. clonalOverlay() can be used to look across all cells or faceted by a metadata variable using facet. As we facet, the overall dimensional reduction will be maintained, while the contour plots will adjust based on the facet variable. Coloring of the dot plot is based on the active identity of the single-cell object. This visualization was authored by Dr. Francesco Mazziotta from Johns Hopkins and inspired by Drs. Carmona and Andreatta and their work with ProjectTIL.
+```{r}
+clonalOverlay(seurat, 
+              reduction = "umap", 
+              freq.cutpoint = 20, 
+              bins = 20, 
+              facet = "orig.ident") + 
+                 guides(color = "none")
+```
+###clonalNetwork
+Similar to clonalOverlay(), we can look at the network interaction of clonotypes shared between clusters along the single-cell dimensional reduction using clonalNetwork(). This function shows the relative proportion of clones that come from the starting node, with the ending node indicated by the arrow.
+
+Filtering for clones can be accomplished using 3 methods:
+
+filter.clones
+
+Select a number to isolate the clones comprising the top X number of cells (filter.clones = 2000)
+Select “min” to make sure all groups are scaled to the size of the minimum group
+filter.identity
+For the identity chosen to visualize, show the to and from network connections for a single group
+
+filter.proportion
+Remove clones that comprise less than a certain proportion of clones in groups.
+```{r}
+#ggraph needs to be loaded due to issues with ggplot
+library(ggraph)
+
+#No Identity filter
+clonalNetwork(seurat, 
+              reduction = "umap", 
+              identity = "ident",
+              filter.clones = NULL,
+              filter.identity = NULL,
+              filter.proportion= 0.1,
+              cloneCall = "strict")
+# can export clones shared between clusters, ranked by clone copies
+# can filter clones differently, can focus on specific chain
+```
+
+```{r}
+#Examining Cluster 4 only
+clonalNetwork(seurat, 
+              reduction = "umap", 
+              identity = "ident",
+              filter.identity = "4",
+              cloneCall = "aa")
+```
+### exporting clonotype table
+```{r}
+shared.clones <- clonalNetwork(seurat, 
+                      reduction = "umap", 
+                      identity = "ident",
+                      cloneCall = "aa", 
+                      exportClones = TRUE)
+head(shared.clones)
+
+### save...maybe after reveiwer complains
+
+#write.csv(shared.clones, file.path(path, "shared_clones.csv") )
+```
+
+### highlightClonotypes
+We can also look at the clonotypes by calling specific sequences in the highlightClonotypes() below. In order to highlight the clonotypes, we first need to use the cloneCall the type of sequence we will be using and then the specific sequences themselves using sequence. Below you can see the steps to highlight the two most prominent sequences .
+
+```{r}
+seurat <- highlightClonotypes(seurat, 
+              cloneCall= "aa", 
+              sequence = c("NA_CQQGNTLPWTF", 
+                           "NA_CLQSDNMPLTF"))
+DimPlot(seurat, group.by = "highlight") + 
+  theme(plot.title = element_blank())
+
+seurat <- highlightClonotypes(seurat, 
+              cloneCall= "aa", 
+              sequence = shared.clones$clone[1:10])
+DimPlot(seurat, group.by = "highlight") + 
+  theme(plot.title = element_blank())
+
+
+
+#### pick top 10 and see
+```
+### occupiedscRepertoire
+We can also look at the count of cells by cluster assigned into specific frequency ranges, by using the occupiedscRepertoire() function and selecting the x.axis to display cluster or other variables in the metadata of the single-cell object.
+
+proportion can be used to looked at a relative level groupings
+label will still return absolute number of clonotypes
+
+```{r}
+
+occupiedscRepertoire(seurat, x.axis = "ident")
+
+#ggsave(file.path(path, "clonotype_by_cluster_clontype_by_singlecells_bar.png"), width=7, height=7)
+#ggsave(file.path(path, "clonotype_by_cluster_clontype_by_singlecells_bar.svg"), width=7, height=7)
+
+```
+### alluvialClonotypes
+After the metadata has been modified, we can look at clonotypes across multiple categories using the alluvialClonotypes() function. To understand the basic concepts of this graphing method, I’d highly recommend reading this post, essentially we are able to use the plots to examine the interchange of categorical variables. Because this function will produce a graph with each clonotype arranged by called stratifications, this will take some time depending on the size of your total cells. To expedite, we will actually subset the seurat object before using alluvialClonotypes().
+
+```{r}
+
+### make colors bolder
+alluvialClonotypes(seurat, cloneCall = "gene", 
+                   y.axes = c("v_chain",  "ident", "orig.ident" ), 
+                   color = "v_chain")+ 
+    scale_fill_manual(values = c( 
+                                 "blue",
+                                 "orange",
+                                 "yellow",
+                                 "black",
+                                 "red", 
+                                 "grey"))  
+
+#ggsave(file.path(path, "clonotype_by_cluster_selected_IghV_bymonth_alluvial.png"), width=7, height=7)
+#ggsave(file.path(path, "clonotype_by_cluster_selected_IghV_bymonth_alluvial.svg"), width=7, height=7)
+
+
+```
+### top 5 clonotypes
+
+```{r}
+
+### make one with selected clonotypes- another figure, top 5 clonotypes + other
+
+top5 <- shared.clones[1:5,]
+
+1 NA_CQQGNTLPWTF                  118
+2 NA_CLQSDNMPLTF                   50
+3 NA_CLQSDNLPLTF                   47
+4 NA_CQQSKEVPWTF                   44
+5 CVRGNWDGNYYYAMDYW_CWQGTHFPYTF    42
+
+### make one without the "other" here
+
+
+#ggsave()
+
+
+```
+
+
+## by cluster
+```{r}
+combined2 <- expression2List(seurat, 
+                             split.by = "ident")
+length(combined2) #now listed by cluster
+```
+
+
+```{r}
+clonotypeBias(seurat, 
+              cloneCall = "aa", 
+              split.by = "orig.ident", 
+              group.by = "ident",
+              n.boots = 20, 
+              min.expand =10)
+```
+
+```{r}
+clonalOverlap(combined2, 
+              cloneCall="aa", 
+              method="overlap")
+```
+
+
+```{r}
+clonalDiversity(combined2, 
+                split.by = "ident", 
+                cloneCall = "nt", exportTable = F)
+
+
+```
+```{r}
+clonalHomeostasis(combined2, 
+                  cloneCall = "nt")
+
+```
+```{r}
+
+clonalProportion(combined2, 
+                 cloneCall = "nt")
+```
+# Heatmap of myc transcription factors
+```{r}
+library(nichenetr)
+# load data
+pbmc.int <- readRDS("pbmc_int.RDS")
+
+# selected genes
+genes <- c("esr1", "sp1", "jun", "ap1", "rela", "nfkb1", "rel", "jund", "srf", "hif1a", "nfkb", "tfap2a", "nfatc1", "cebpb", "smad1", "ssrp1", "stat5a", "stat3", "fos", "klf5", "tgfb1i1")
+genes <- toupper(genes)
+
+# 21 genes
+#nconvert to mouse genes
+genes <- genes %>% nichenetr::convert_human_to_mouse_symbols() #%>% 
+  #na.omit() %>%  list()
+# AP1 and NEKB
+
+genes <- append(genes, "AP1")
+Idents(pbmc.int) <- pbmc.int$orig.ident
+DefaultAssay(pbmc.int) <- "RNA"
+# make heatmap
+## group by month
+DoHeatmap(pbmc.int, features=genes, group.by = "ident", slot="scale.data")
+## change color to blue vs red
+
+```
+```{r}
+counts <- GetAssayData(pbmc.int, assay="RNA", slot="data")
+
+x <- rownames(counts)
+
+counts <- as.matrix(counts[rownames(counts) %in% genes, ])
+#You can then prepare your metadata using this code.
+
+metadata <- pbmc.int[[]]
+metadata <- metadata[rownames(metadata) %in% colnames(counts), ]
+```
+
+```{r}
+library(dittoSeq)
+
+```
+
+
+# Transcription Factor Activity
+## Packages
+```{r}
+## We load the required packages
+library(Seurat)
+library(decoupleR)
+
+# Only needed for data handling and plotting
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(pheatmap)
+library(nichenetr)
+```
+
+## Load integrated data
+```{r}
+data <- readRDS("pbmc_int.RDS")
+
+data <- subset(data, orig.ident!="m4")
+```
+
+## Get Network
+```{r}
+# processed regulons
+# net <- decoupleR::get_collectri(organism='10090', split_complexes=FALSE)
+# 
+# net$source <- nichenetr::convert_human_to_mouse_symbols(net$source)
+# net$target <- nichenetr::convert_human_to_mouse_symbols(net$target)
+# net <- distinct(net) %>% na.omit()
+# saveRDS(net, "net.RDS")
+net <- readRDS("net.RDS")
+```
+
+## Activity inference with Univariate Linear Model (ULM)
+To infer TF enrichment scores we will run the Univariate Linear Model (ulm) method. For each sample in our dataset (mat) and each TF in our network (net), it fits a linear model that predicts the observed gene expression based solely on the TF’s TF-Gene interaction weights. Once fitted, the obtained t-value of the slope is the score. If it is positive, we interpret that the TF is active and if it is negative we interpret that it is inactive.
+
+```{r}
+# Extract the normalized log-transformed counts
+mat <- as.matrix(data@assays$RNA@data)
+rm(data)
+
+#net_myc <- net[which(net$source=="Myc"),] 
+
+# check_repeated_edges <- function(network){
+# 
+#     # NSE vs. R CMD check workaround
+#     source <- target <- NULL
+# 
+#     repeated <- network %>%
+#         group_by(source, target) %>%
+#         filter(n()>1)
+#     if (nrow(repeated) > 1){
+#         stop('Network contains repeated edges, please remove them.')
+#     }
+# }
+# repeated <- net_myc %>% group_by(source, target) %>% filter(n()>1)
+
+# Run ulm
+acts <- run_ulm(mat=mat, net=net, .source='source', .target='target',
+                .mor='mor', minsize = 5)
+acts
+```
+
+## Visualisation
+```{r}
+# Extract ulm and store it in tfsulm in pbmc
+data[['tfsulm']] <- acts %>%
+  pivot_wider(id_cols = 'source', names_from = 'condition',
+              values_from = 'score') %>%
+  column_to_rownames('source') %>%
+  Seurat::CreateAssayObject(.)
+
+# Change assay
+DefaultAssay(object = data) <- "tfsulm"
+
+# Scale the data
+data <- ScaleData(data)
+data@assays$tfsulm@data <- data@assays$tfsulm@scale.data
+```
+
+### plots
+```{r}
+p1 <- DimPlot(data, reduction = "umap", label = TRUE, pt.size = 0.5) + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- (FeaturePlot(data, features = c("MYC")) & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) +
+  ggtitle('MYC activity')
+DefaultAssay(object = data) <- "RNA"
+p3 <- FeaturePlot(data, features = c("MYC")) + ggtitle('MYC expression')
+DefaultAssay(object = data) <- "tfsulm"
+p1 | p2 | p3
+```
+
+## Exploration
+We can also see what is the mean activity per group of the top 20 more variable TFs:
+
+```{r}
+n_tfs <- 25
+# Extract activities from object as a long dataframe
+df <- t(as.matrix(data@assays$tfsulm@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(data)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Get top tfs with more variable means across clusters
+tfs <- df %>%
+  group_by(source) %>%
+  summarise(std = sd(mean)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+
+# Subset long data frame to top tfs and transform to wide matrix
+top_acts_mat <- df %>%
+  filter(source %in% tfs) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+# Choose color palette
+palette_length = 100
+my_color = colorRampPalette(c("Darkblue", "white","red"))(palette_length)
+
+my_breaks <- c(seq(-3, 0, length.out=ceiling(palette_length/2) + 1),
+               seq(0.05, 3, length.out=floor(palette_length/2)))
+
+# Plot
+pheatmap(top_acts_mat, border_color = NA, color=my_color, breaks = my_breaks) 
+```
+
+# cell numbers and percentage by cluster and time
+```{r}
+library(data.table)
+
+df <- data@meta.data %>% as.data.table
+# cell number by cluster, separated by time
+View(df[, .N, by = c("orig.ident", "integrated_snn_res.0.5")])
+
+
+# cell percentage by cluster, separated by time
+
+# barplots of each
+p1 <- ggplot(data@meta.data, aes(integrated_snn_res.0.5, fill=orig.ident))+geom_bar(stat="count",width=.5, position = "dodge")
+p1
+#ggsave("outs/cluster_specs/cell_number_by_cluster_barplot.svg", width=7, height=7)
+```
+
+# percentages
+```{r}
+total_by_month <- as.data.frame(table(Idents(data)))
+#write.csv(total_by_month, "outs/cluster_specs/totalcells_by_month.csv")
+```
+
+```{r}
+table(Idents(data), data$integrated_snn_res.0.5)
+
+counts_by_cluster_time <- as.data.frame(table(Idents(data), data$integrated_snn_res.0.5))
+names(counts_by_cluster_time) <- c("time", "cluster", "counts")
+
+prop_by_time.m2 <- counts_by_cluster_time %>% filter( time=="m2") %>% mutate(proportion=counts/sum(counts))
+prop_by_time.m4 <- counts_by_cluster_time %>% filter( time=="m4") %>% mutate(proportion=counts/sum(counts))
+prop_by_time.m7 <- counts_by_cluster_time %>% filter( time=="m7") %>% mutate(proportion=counts/sum(counts))
+
+prop_by_time <- rbind(prop_by_time.m2, prop_by_time.m4, prop_by_time.m7)
+#write.csv(prop_by_time,"outs/cluster_specs/proportion_cellnumbers_by_cluster.csv")
+
+
+p2 <- ggplot(prop_by_time, aes(cluster, y=proportion, fill=time))+geom_bar(stat="identity", width=.5, position = "dodge")
+p2
+#ggsave("outs/cluster_specs/barplot_proportion_by_cluster.svg", plot=p2, width=7, height=7)
+
+```
+```{r}
+p1 | p2
+```
+
+
+```{r}
+
+prop_within_cluster <- as.data.frame(prop.table(table(Idents(data), data$integrated_snn_res.0.5), margin = 2))
+names(prop_within_cluster) <- c("time", "cluster", "proportion")
+
+```
+```{r}
+p3 <- ggplot(prop_within_cluster, aes(cluster, y=proportion, fill=time))+geom_bar(stat="identity", width=.5, position = "dodge")
+p3
+#ggsave("outs/cluster_specs/barplot_proportion_by_month_within_each_cluster.svg", plot=p3, width=7, height=7)
+```
+
+## Get Network
+```{r}
+# processed regulons
+# net <- decoupleR::get_collectri(organism='10090', split_complexes=FALSE)
+# 
+# net$source <- nichenetr::convert_human_to_mouse_symbols(net$source)
+# net$target <- nichenetr::convert_human_to_mouse_symbols(net$target)
+# net <- distinct(net) %>% na.omit()
+# saveRDS(net, "net.RDS")
+net <- readRDS("net.RDS")
+```
+
+## Activity inference with Univariate Linear Model (ULM)
+To infer TF enrichment scores we will run the Univariate Linear Model (ulm) method. For each sample in our dataset (mat) and each TF in our network (net), it fits a linear model that predicts the observed gene expression based solely on the TF’s TF-Gene interaction weights. Once fitted, the obtained t-value of the slope is the score. If it is positive, we interpret that the TF is active and if it is negative we interpret that it is inactive.
+
+```{r}
+# Extract the normalized log-transformed counts
+mat <- as.matrix(data@assays$RNA@data)
+#rm(data)
+
+#net_myc <- net[which(net$source=="Myc"),] 
+
+# check_repeated_edges <- function(network){
+# 
+#     # NSE vs. R CMD check workaround
+#     source <- target <- NULL
+# 
+#     repeated <- network %>%
+#         group_by(source, target) %>%
+#         filter(n()>1)
+#     if (nrow(repeated) > 1){
+#         stop('Network contains repeated edges, please remove them.')
+#     }
+# }
+# repeated <- net_myc %>% group_by(source, target) %>% filter(n()>1)
+
+# Run ulm
+# acts <- run_ulm(mat=mat, net=net, .source='source', .target='target',
+#                 .mor='mor', minsize = 5)
+
+# saveRDS(acts, "acts.RDS")
+acts <- readRDS("acts.RDS")
+```
+
+## Visualisation
+```{r}
+# Extract ulm and store it in tfsulm in pbmc
+data[['tfsulm']] <- acts %>%
+  pivot_wider(id_cols = 'source', names_from = 'condition',
+              values_from = 'score') %>%
+  column_to_rownames('source') %>%
+  Seurat::CreateAssayObject(.)
+
+# Change assay
+DefaultAssay(object = data) <- "tfsulm"
+
+# Scale the data
+data <- ScaleData(data)
+data@assays$tfsulm@data <- data@assays$tfsulm@scale.data
+```
+
+### plots
+```{r}
+
+# split by timepoint
+
+p1 <- DimPlot(data, reduction = "umap", label = TRUE, pt.size = 0.5)  + ggtitle('Cell types')
+p1
+
+p2 <- (FeaturePlot(data, features = c("Myc"), split.by='ident') & 
+  scale_colour_gradient2(low = 'blue', mid = 'white', high = 'red')) + RestoreLegend()
+
+p2
+
+DefaultAssay(object = data) <- "RNA"
+p3 <- FeaturePlot(data, features = c("Myc"), split.by = 'ident') #+ ggtitle('Myc expression')
+DefaultAssay(object = data) <- "tfsulm"
+p3
+ggsave("Myc_expression_umap.svg", width=14, height=7, plot=p3)
+p2
+ggsave("Myc_activity_expression_umap.svg", width=14, height=7, plot=p2)
+```
+
+## Exploration
+We can also see what is the mean activity per group of the top 20 more variable TFs:
+
+```{r}
+n_tfs <- 25
+# Extract activities from object as a long dataframe
+df <- t(as.matrix(data@assays$tfsulm@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(data)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Get top tfs with more variable means across clusters
+tfs <- df %>%
+  group_by(source) %>%
+  summarise(std = sd(mean)) %>%
+  arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  pull(source)
+
+# Subset long data frame to top tfs and transform to wide matrix
+top_acts_mat <- df %>%
+  filter(source %in% tfs) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+# Subset Myc only
+myc_act <- df %>%
+  filter(source == "Myc") %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+# Subset Myc-regulating TFs
+myc_tfs <- c("Myc", "Esr1", "Sp1", "Jun", "Rela", "Nfkb1", "Jund", "Srf", "Hif1a", "Nfkb2", "Tfap2a", "Nfatc1", "Cebpb", "Smad1", "Ssrp1", "Stat5a", "Stat3", "Fos", "Klf5", "Tgfb1i1")
+
+myc_regs <- df %>%
+  filter(source %in% myc_tfs) %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+  
+  
+  
+  
+# Choose color palette
+palette_length = 100
+my_color = colorRampPalette(c("Darkblue", "white","red"))(palette_length)
+
+my_breaks <- c(seq(-1, 0, length.out=ceiling(palette_length/2) + 1),
+               seq(0.05, 1, length.out=floor(palette_length/2)))
+
+# Plot
+p1 <- pheatmap(top_acts_mat, border_color = NA, color=my_color, breaks = my_breaks) 
+p2 <- pheatmap(myc_act, border_color = NA, color=my_color, breaks = my_breaks, cluster_rows =F, cluster_cols = F) 
+p3 <- pheatmap(myc_regs, border_color = NA, color=my_color, breaks = my_breaks, cluster_rows =F, cluster_cols = T) 
+p3
+ggsave("myc_regulator_transcriptionfactors.svg", width=7, height = 7, plot=p3)
+
+p1 
+ggsave("top_20_transcriptionfactors_heatmap.svg", width=7, height=7, plot = p1)
+p2
+#ggsave("myc_heatmap.svg", width=7, height=7)
+
+
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+
+
